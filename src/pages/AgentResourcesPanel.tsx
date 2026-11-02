@@ -87,8 +87,8 @@ export function AgentResourcesPanel({ kind }: { kind: 'skills' | 'mcp' }) {
     setBusy(true);
     setEditorError('');
     try {
-      if (kind === 'skills') await updateAgentSkill(editor.name, editor.path || null, targets);
-      else await updateAgentMcp(editor.name, entries, editor.expected);
+      if (kind === 'skills') await updateAgentSkill(editor.name, editor.existing ? null : editor.path || null, targets, editor.existing ? 'edit' : 'create');
+      else await updateAgentMcp(editor.name, entries, editor.expected, editor.existing ? 'edit' : 'create');
       setEditor(null);
       await refresh();
       setSuccess(true);
@@ -101,8 +101,8 @@ export function AgentResourcesPanel({ kind }: { kind: 'skills' | 'mcp' }) {
     setError('');
     setSuccess(false);
     try {
-      if (kind === 'skills') await updateAgentSkill(name, null, [], true);
-      else await updateAgentMcp(name, [], snapshot?.mcp.filter(entry => entry.id === name) ?? [], true);
+      if (kind === 'skills') await updateAgentSkill(name, null, [], 'remove');
+      else await updateAgentMcp(name, [], snapshot?.mcp.filter(entry => entry.id === name) ?? [], 'remove');
       await refresh();
       setSuccess(true);
     } catch (reason) { setError(String(reason)); }

@@ -27,11 +27,36 @@ describe('local resource editor', () => {
   });
   test('browser runtime persists resource mutations within a session', () => {
     const mock = createAgentResourcesMock('empty');
-    mock('update_agent_skill', { name: 'fixture', source: '/fixtures/source', targets: ['codex'], remove: false });
+    mock('update_agent_skill', { name: 'fixture', source: '/fixtures/source', targets: ['codex'], operation: 'create' });
     expect(mock('get_agent_resources', {})?.value).toMatchObject({ skills: [{ name: 'fixture', installed: { codex: true } }] });
-    mock('update_agent_skill', { name: 'fixture', remove: true });
+    mock('update_agent_skill', { name: 'fixture', operation: 'remove' });
     expect(mock('get_agent_resources', {})?.value).toEqual({ skills: [], mcp: [], errors: [] });
     expect(() => createAgentResourcesMock('error')('get_agent_resources', {})).toThrow();
+  });
+  test('duplicate Skill import leaves the session unchanged and only explicit edit changes targets', () => {
+    const mock = createAgentResourcesMock('empty');
+    mock('update_agent_skill', { name: 'fixture', source: '/fixtures/A', targets: ['claude'], operation: 'create' });
+    const before = mock('get_agent_resources', {})?.value;
+    expect(() => mock('update_agent_skill', { name: 'fixture', source: '/fixtures/B', targets: ['codex', 'gemini'], operation: 'create' })).toThrow('already managed');
+    expect(mock('get_agent_resources', {})?.value).toEqual(before);
+    expect(() => mock('update_agent_skill', { name: 'fixture', source: '/fixtures/B', targets: ['codex'] })).toThrow('operation');
+    expect(mock('get_agent_resources', {})?.value).toEqual(before);
+    mock('update_agent_skill', { name: 'fixture', source: null, targets: ['gemini'], operation: 'edit' });
+    expect(mock('get_agent_resources', {})?.value).toMatchObject({ skills: [{ source: '/fixtures/A', installed: { claude: false, gemini: true } }] });
+    expect(() => mock('update_agent_skill', { name: 'missing', targets: [], operation: 'edit' })).toThrow();
+  });
+  test('MCP creation rejects active and disabled identifiers even with matching expected entries', () => {
+    const mock = createAgentResourcesMock('empty');
+    for (const enabled of [true, false]) {
+      const entries = [{ id: `docs-${enabled}`, agent: 'claude', enabled, spec: { type: 'stdio', command: 'fixture-A' } }];
+      mock('update_agent_mcp', { id: entries[0].id, entries, expected: [], operation: 'create' });
+      const before = mock('get_agent_resources', {})?.value;
+      for (const expected of [[], entries]) {
+        expect(() => mock('update_agent_mcp', { id: entries[0].id, entries: [], expected, operation: 'create' })).toThrow('already exists');
+        expect(mock('get_agent_resources', {})?.value).toEqual(before);
+      }
+      mock('update_agent_mcp', { id: entries[0].id, entries, expected: entries, operation: 'edit' });
+    }
   });
   test('all current locales include every resource label', () => {
     for (const locale of [agentResourcesZhCN, agentResourcesZhTW, agentResourcesJa]) {

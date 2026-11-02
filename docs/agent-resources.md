@@ -23,6 +23,14 @@ unmanaged installations are never removed. Conflicting names, symbolic links,
 path traversal, and externally modified managed copies are rejected. To update
 Skill contents, import the updated source under a new identifier.
 
+Import/create and edit/remove are explicit operations. Importing a managed Skill
+identifier or creating an existing MCP identifier is rejected before any writes,
+including when an MCP entry is disabled. Use Manage to edit an existing resource;
+Skill edits retain the cached source and its fingerprint protection.
+Empty directory layout is preserved and included in the modification guard;
+existing file-only fingerprints remain compatible. MCP conflict checks and
+proposed writes use the same configuration and registry reads.
+
 The MCP editor masks environment variables and headers by default. It does not
 execute commands or start servers. Clients may start enabled servers when they
 next load their configurations. Disabling removes a server from the selected

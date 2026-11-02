@@ -13,6 +13,14 @@ static LOCK: Mutex<()> = Mutex::new(());
 const AGENTS: [&str; 3] = ["claude", "codex", "gemini"];
 type Result<T> = std::result::Result<T, String>;
 
+#[derive(Clone, Copy, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum ResourceOperation {
+    Create,
+    Edit,
+    Remove,
+}
+
 #[derive(Default, Serialize, Deserialize)]
 struct Registry {
     #[serde(default)]
@@ -108,8 +116,11 @@ fn read(path: &Path) -> Result<Option<Vec<u8>>> {
     }
 }
 fn registry(home: &Path) -> Result<Registry> {
-    match read(&store(home).join("state.json"))? {
-        Some(bytes) => serde_json::from_slice(&bytes)
+    parse_registry(read(&store(home).join("state.json"))?.as_deref())
+}
+fn parse_registry(bytes: Option<&[u8]>) -> Result<Registry> {
+    match bytes {
+        Some(bytes) => serde_json::from_slice(bytes)
             .map_err(|_| "Invalid resource registry; nothing was changed".into()),
         None => Ok(Registry::default()),
     }
@@ -157,6 +168,7 @@ fn save_registry(home: &Path, state: &Registry) -> Result<()> {
 struct SkillFile {
     bytes: Vec<u8>,
     permissions: fs::Permissions,
+    directory: bool,
 }
 fn files(directory: &Path) -> Result<BTreeMap<PathBuf, SkillFile>> {
     fn walk(
@@ -175,6 +187,27 @@ fn files(directory: &Path) -> Result<BTreeMap<PathBuf, SkillFile>> {
             no_links(&path)?;
             if path.is_dir() {
                 walk(root, &path, depth + 1, result, total)?;
+                if fs::read_dir(&path)
+                    .map_err(|_| "Cannot read skill directory")?
+                    .next()
+                    .is_none()
+                {
+                    if result.len() >= 2000 {
+                        return Err("Skill exceeds 2000 files or empty directories".into());
+                    }
+                    result.insert(
+                        path.strip_prefix(root)
+                            .map_err(|_| "Invalid skill path")?
+                            .to_path_buf(),
+                        SkillFile {
+                            bytes: Vec::new(),
+                            permissions: fs::metadata(&path)
+                                .map_err(|_| "Cannot inspect skill permissions")?
+                                .permissions(),
+                            directory: true,
+                        },
+                    );
+                }
             } else if path.is_file() {
                 let size = fs::metadata(&path)
                     .map_err(|_| "Cannot inspect skill file")?
@@ -197,6 +230,7 @@ fn files(directory: &Path) -> Result<BTreeMap<PathBuf, SkillFile>> {
                     SkillFile {
                         bytes: content,
                         permissions,
+                        directory: false,
                     },
                 );
             } else {
@@ -207,7 +241,10 @@ fn files(directory: &Path) -> Result<BTreeMap<PathBuf, SkillFile>> {
     }
     let mut result = BTreeMap::new();
     walk(directory, directory, 0, &mut result, &mut 0)?;
-    if !result.contains_key(Path::new("SKILL.md")) {
+    if !result
+        .get(Path::new("SKILL.md"))
+        .is_some_and(|entry| !entry.directory)
+    {
         return Err("Skill directory must contain SKILL.md".into());
     }
     Ok(result)
@@ -215,6 +252,9 @@ fn files(directory: &Path) -> Result<BTreeMap<PathBuf, SkillFile>> {
 fn fingerprint(content: &BTreeMap<PathBuf, SkillFile>) -> String {
     let mut digest = Sha256::new();
     for (path, file) in content {
+        if file.directory {
+            digest.update(b"directory\0");
+        }
         let name = path.to_string_lossy();
         digest.update((name.len() as u64).to_le_bytes());
         digest.update(name.as_bytes());
@@ -274,7 +314,11 @@ fn copy_skill(destination: &Path, content: &BTreeMap<PathBuf, SkillFile>) -> Res
     let outcome = (|| {
         for (relative, file) in content {
             let path = staging.join(relative);
-            atomic(&path, &file.bytes)?;
+            if file.directory {
+                fs::create_dir_all(&path).map_err(|_| "Cannot create skill directory")?;
+            } else {
+                atomic(&path, &file.bytes)?;
+            }
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -379,19 +423,23 @@ fn skill_change(
     name: &str,
     source: Option<&str>,
     targets: &[String],
-    remove: bool,
+    operation: ResourceOperation,
 ) -> Result<()> {
     valid_id(name)?;
     for agent in targets {
         agent_dir(home, agent)?;
     }
     let mut state = registry(home)?;
+    let importing = operation == ResourceOperation::Create;
+    let remove = operation == ResourceOperation::Remove;
+    if importing && state.skills.contains_key(name) {
+        return Err("Skill identifier already managed; use Manage to edit it".into());
+    }
+    if !importing && !state.skills.contains_key(name) {
+        return Err("Unmanaged source directories cannot be edited or removed".into());
+    }
     let cache = store(home).join("skills").join(name);
     no_links(&cache)?;
-    let importing = !state.skills.contains_key(name);
-    if remove && importing {
-        return Err("Unmanaged source directories cannot be removed".into());
-    }
     let source_path = if importing {
         let path = PathBuf::from(source.ok_or("Select a source directory")?);
         if !path.is_absolute() {
@@ -533,7 +581,8 @@ fn config_path(home: &Path, agent: &str) -> Result<PathBuf> {
         _ => Err("Unsupported MCP target".into()),
     }
 }
-fn config(home: &Path, agent: &str) -> Result<(PathBuf, Option<Vec<u8>>, Value)> {
+type ConfigDocument = (PathBuf, Option<Vec<u8>>, Value);
+fn config(home: &Path, agent: &str) -> Result<ConfigDocument> {
     let path = config_path(home, agent)?;
     let bytes = read(&path)?;
     let value = match &bytes {
@@ -724,20 +773,25 @@ fn mcp_change(
     home: &Path,
     id: &str,
     entries: &[McpEntry],
-    remove: bool,
+    operation: ResourceOperation,
     expected: &[McpEntry],
 ) -> Result<()> {
+    mcp_change_with_reader(home, id, entries, operation, expected, config)
+}
+fn mcp_change_with_reader(
+    home: &Path,
+    id: &str,
+    entries: &[McpEntry],
+    operation: ResourceOperation,
+    expected: &[McpEntry],
+    mut load_config: impl FnMut(&Path, &str) -> Result<ConfigDocument>,
+) -> Result<()> {
     valid_id(id)?;
-    let current = snapshot(home)?;
-    let actual: Vec<_> = current
-        .mcp
-        .into_iter()
-        .filter(|entry| entry.id == id)
-        .collect();
-    if serde_json::to_value(&actual).ok() != serde_json::to_value(expected).ok() {
-        return Err("Server changed since it was opened; refresh before saving".into());
-    }
-    let mut state = registry(home)?;
+    let registry_path = store(home).join("state.json");
+    let registry_original = read(&registry_path)?;
+    let mut state = parse_registry(registry_original.as_deref())?;
+    let mut actual = Vec::new();
+    let remove = operation == ResourceOperation::Remove;
     let mut writes = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
     for entry in entries {
@@ -753,12 +807,31 @@ fn mcp_change(
             entries.iter().find(|entry| entry.agent == agent)
         };
         let (path, original, mut value) =
-            config(home, agent).map_err(|error| format!("{agent}: {error}"))?;
+            load_config(home, agent).map_err(|error| format!("{agent}: {error}"))?;
         let key = if agent == "codex" {
             "mcp_servers"
         } else {
             "mcpServers"
         };
+        if let Some(raw) = value.get(key).and_then(|map| map.get(id)) {
+            actual.push(McpEntry {
+                id: id.into(),
+                agent: agent.into(),
+                enabled: raw.get("enabled").and_then(Value::as_bool).unwrap_or(true),
+                spec: normalize(agent, raw.clone())?,
+            });
+        } else if let Some(spec) = state
+            .disabled
+            .get(agent)
+            .and_then(|entries| entries.get(id))
+        {
+            actual.push(McpEntry {
+                id: id.into(),
+                agent: agent.into(),
+                enabled: false,
+                spec: spec.clone(),
+            });
+        }
         let had_live = value.get(key).and_then(|map| map.get(id)).is_some();
         state.disabled.entry(agent.into()).or_default().remove(id);
         if selected.is_none() && !had_live {
@@ -785,10 +858,18 @@ fn mcp_change(
         let bytes = serialize_config(agent, original.as_deref(), &value, id)?;
         writes.push((path, original, bytes));
     }
-    let registry_path = store(home).join("state.json");
+    if operation == ResourceOperation::Create && !actual.is_empty() {
+        return Err("Server identifier already exists; use Manage to edit it".into());
+    }
+    if operation != ResourceOperation::Create && actual.is_empty() {
+        return Err("Server no longer exists; refresh before saving".into());
+    }
+    if serde_json::to_value(&actual).ok() != serde_json::to_value(expected).ok() {
+        return Err("Server changed since it was opened; refresh before saving".into());
+    }
     writes.push((
-        registry_path.clone(),
-        read(&registry_path)?,
+        registry_path,
+        registry_original,
         serde_json::to_vec_pretty(&state).map_err(|_| "Cannot serialize registry")?,
     ));
     for (path, original, _) in &writes {
@@ -901,21 +982,21 @@ pub fn update_agent_skill(
     name: String,
     source: Option<String>,
     targets: Vec<String>,
-    remove: bool,
+    operation: ResourceOperation,
 ) -> Result<()> {
     let _guard = LOCK.lock().map_err(|_| "Resource operation unavailable")?;
-    skill_change(&home(&app)?, &name, source.as_deref(), &targets, remove)
+    skill_change(&home(&app)?, &name, source.as_deref(), &targets, operation)
 }
 #[tauri::command]
 pub fn update_agent_mcp(
     app: tauri::AppHandle,
     id: String,
     entries: Vec<McpEntry>,
-    remove: bool,
+    operation: ResourceOperation,
     expected: Vec<McpEntry>,
 ) -> Result<()> {
     let _guard = LOCK.lock().map_err(|_| "Resource operation unavailable")?;
-    mcp_change(&home(&app)?, &id, &entries, remove, &expected)
+    mcp_change(&home(&app)?, &id, &entries, operation, &expected)
 }
 
 #[cfg(test)]
@@ -969,6 +1050,182 @@ mod tests {
             .collect()
     }
 
+    fn fixture_tree(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+        fn visit(root: &Path, directory: &Path, tree: &mut BTreeMap<PathBuf, Option<Vec<u8>>>) {
+            for entry in fs::read_dir(directory).unwrap() {
+                let path = entry.unwrap().path();
+                let relative = path.strip_prefix(root).unwrap().to_path_buf();
+                if path.is_dir() {
+                    tree.insert(relative, None);
+                    visit(root, &path, tree);
+                } else {
+                    tree.insert(relative, Some(fs::read(path).unwrap()));
+                }
+            }
+        }
+        let mut tree = BTreeMap::new();
+        visit(root, root, &mut tree);
+        tree
+    }
+
+    #[test]
+    fn duplicate_skill_import_preserves_sources_registry_and_installed_copies() {
+        let fixture = Fixture::new();
+        let source_a = fixture.skill();
+        fixture.write("source-b/SKILL.md", "Different source B instructions");
+        fixture.write("source-b/scripts/check.sh", "echo source-b");
+        let source_b = fixture.0.join("source-b");
+        skill_change(
+            &fixture.0,
+            "fixture",
+            source_a.to_str(),
+            &["claude".into()],
+            ResourceOperation::Create,
+        )
+        .unwrap();
+        let before = fixture_tree(&fixture.0);
+        for source in [source_b.to_str(), None] {
+            let error = skill_change(
+                &fixture.0,
+                "fixture",
+                source,
+                &["codex".into(), "gemini".into()],
+                ResourceOperation::Create,
+            )
+            .unwrap_err();
+            assert!(error.contains("already managed"), "{error}");
+            assert_eq!(fixture_tree(&fixture.0), before);
+        }
+        assert!(skill_change(
+            &fixture.0,
+            "missing",
+            source_b.to_str(),
+            &[],
+            ResourceOperation::Edit
+        )
+        .is_err());
+        assert_eq!(fixture_tree(&fixture.0), before);
+        skill_change(
+            &fixture.0,
+            "fixture",
+            None,
+            &["gemini".into()],
+            ResourceOperation::Edit,
+        )
+        .unwrap();
+        assert!(!fixture.0.join(".claude/skills/fixture").exists());
+        assert_eq!(
+            fingerprint(&files(&fixture.0.join(".gemini/skills/fixture")).unwrap()),
+            fingerprint(&files(&source_a).unwrap())
+        );
+    }
+
+    #[test]
+    fn skill_import_preserves_empty_directories_and_guards_layout_changes() {
+        let fixture = Fixture::new();
+        let source = fixture.skill();
+        let legacy_hash = fingerprint(&files(&source).unwrap());
+        fs::create_dir_all(source.join("output/nested-empty")).unwrap();
+        fs::create_dir(source.join("cache")).unwrap();
+        let source_tree = fixture_tree(&source);
+        skill_change(
+            &fixture.0,
+            "fixture",
+            source.to_str(),
+            &targets(),
+            ResourceOperation::Create,
+        )
+        .unwrap();
+        let cache = store(&fixture.0).join("skills/fixture");
+        assert_eq!(fixture_tree(&cache), source_tree);
+        assert_ne!(fingerprint(&files(&cache).unwrap()), legacy_hash);
+        for agent in AGENTS {
+            assert_eq!(
+                fixture_tree(&agent_dir(&fixture.0, agent).unwrap().join("skills/fixture")),
+                source_tree
+            );
+        }
+        skill_change(&fixture.0, "fixture", None, &[], ResourceOperation::Edit).unwrap();
+        fs::remove_dir(cache.join("output/nested-empty")).unwrap();
+        let before = fixture_tree(&fixture.0);
+        assert!(
+            skill_change(&fixture.0, "fixture", None, &[], ResourceOperation::Remove)
+                .unwrap_err()
+                .contains("changed externally")
+        );
+        assert_eq!(fixture_tree(&fixture.0), before);
+        assert_eq!(fixture_tree(&source), source_tree);
+    }
+
+    #[test]
+    fn mcp_external_change_during_config_read_is_never_overwritten() {
+        for change_after_read in [false, true] {
+            let fixture = Fixture::new();
+            mcp_change(
+                &fixture.0,
+                "docs",
+                &entries("docs"),
+                ResourceOperation::Create,
+                &[],
+            )
+            .unwrap();
+            let previous = expected(&fixture, "docs");
+            let mut reads = BTreeMap::new();
+            let mut external_tree = None;
+            let error = mcp_change_with_reader(&fixture.0, "docs", &entries("docs"), ResourceOperation::Edit, &previous, |home, agent| {
+                *reads.entry(agent.to_string()).or_insert(0) += 1;
+                let captured = if change_after_read { Some(config(home, agent)?) } else { None };
+                if agent == "claude" {
+                    fixture.write(".claude.json", r#"{"mcpServers":{"docs":{"command":"external-new-server"}},"external":true}"#);
+                    external_tree = Some(fixture_tree(&fixture.0));
+                }
+                match captured { Some(value) => Ok(value), None => config(home, agent) }
+            }).unwrap_err();
+            assert!(error.contains("changed"), "{error}");
+            assert_eq!(reads.values().copied().collect::<Vec<_>>(), vec![1, 1, 1]);
+            assert_eq!(fixture_tree(&fixture.0), external_tree.unwrap());
+        }
+    }
+
+    #[test]
+    fn duplicate_mcp_create_preserves_active_and_disabled_entries_without_writes() {
+        let fixture = Fixture::new();
+        for enabled in [true, false] {
+            let id = if enabled { "live" } else { "disabled" };
+            let mut original = entries(id);
+            for entry in &mut original {
+                entry.enabled = enabled;
+            }
+            mcp_change(&fixture.0, id, &original, ResourceOperation::Create, &[]).unwrap();
+            let previous = expected(&fixture, id);
+            let before = fixture_tree(&fixture.0);
+            for expected in [&[][..], previous.as_slice()] {
+                let error = mcp_change(&fixture.0, id, &[], ResourceOperation::Create, expected)
+                    .unwrap_err();
+                assert!(error.contains("already exists"), "{error}");
+                assert_eq!(fixture_tree(&fixture.0), before);
+            }
+            mcp_change(
+                &fixture.0,
+                id,
+                &original,
+                ResourceOperation::Edit,
+                &previous,
+            )
+            .unwrap();
+        }
+        let before = fixture_tree(&fixture.0);
+        assert!(mcp_change(
+            &fixture.0,
+            "missing",
+            &entries("missing"),
+            ResourceOperation::Edit,
+            &[]
+        )
+        .is_err());
+        assert_eq!(fixture_tree(&fixture.0), before);
+    }
+
     #[test]
     fn discovery_import_sync_uninstall_never_delete_source() {
         let fixture = Fixture::new();
@@ -981,7 +1238,14 @@ mod tests {
         assert_eq!(found.skills[0].name, "existing");
         assert_eq!(found.skills[0].description, "Existing skill");
         assert!(!found.skills[0].managed);
-        skill_change(&fixture.0, "fixture", source.to_str(), &targets(), false).unwrap();
+        skill_change(
+            &fixture.0,
+            "fixture",
+            source.to_str(),
+            &targets(),
+            ResourceOperation::Create,
+        )
+        .unwrap();
         let found = snapshot(&fixture.0).unwrap();
         let imported = found
             .skills
@@ -990,10 +1254,17 @@ mod tests {
             .unwrap();
         assert_eq!(imported.description, "Local fixture description");
         assert_eq!(imported.installed.len(), 3);
-        skill_change(&fixture.0, "fixture", None, &["codex".into()], false).unwrap();
+        skill_change(
+            &fixture.0,
+            "fixture",
+            None,
+            &["codex".into()],
+            ResourceOperation::Edit,
+        )
+        .unwrap();
         assert!(!fixture.0.join(".claude/skills/fixture").exists());
         assert!(fixture.0.join(".codex/skills/fixture/SKILL.md").exists());
-        skill_change(&fixture.0, "fixture", None, &[], true).unwrap();
+        skill_change(&fixture.0, "fixture", None, &[], ResourceOperation::Remove).unwrap();
         assert!(source.join("SKILL.md").exists());
         assert!(!store(&fixture.0).join("skills/fixture").exists());
         assert!(fixture.0.join(".claude/skills/existing/SKILL.md").exists());
@@ -1003,12 +1274,26 @@ mod tests {
         let fixture = Fixture::new();
         let original = fixture.skill();
         let unmanaged = fixture.write(".claude/skills/unmanaged/SKILL.md", "Keep original");
-        assert!(skill_change(&fixture.0, "unmanaged", None, &[], true).is_err());
+        assert!(skill_change(
+            &fixture.0,
+            "unmanaged",
+            None,
+            &[],
+            ResourceOperation::Remove
+        )
+        .is_err());
         assert_eq!(fs::read_to_string(unmanaged).unwrap(), "Keep original");
-        skill_change(&fixture.0, "fixture", original.to_str(), &targets(), false).unwrap();
+        skill_change(
+            &fixture.0,
+            "fixture",
+            original.to_str(),
+            &targets(),
+            ResourceOperation::Create,
+        )
+        .unwrap();
         let cached = store(&fixture.0).join("skills/fixture/SKILL.md");
         fs::write(&cached, "Edited private source").unwrap();
-        assert!(skill_change(&fixture.0, "fixture", None, &[], true).is_err());
+        assert!(skill_change(&fixture.0, "fixture", None, &[], ResourceOperation::Remove).is_err());
         assert_eq!(fs::read_to_string(cached).unwrap(), "Edited private source");
         assert!(original.join("SKILL.md").exists());
         for agent in AGENTS {
@@ -1027,7 +1312,14 @@ mod tests {
         let config = outside.write("settings.json", r#"{"keep":"fixture"}"#);
         fs::create_dir(fixture.0.join(".gemini")).unwrap();
         symlink(&config, fixture.0.join(".gemini/settings.json")).unwrap();
-        assert!(mcp_change(&fixture.0, "docs", &entries("docs"), false, &[]).is_err());
+        assert!(mcp_change(
+            &fixture.0,
+            "docs",
+            &entries("docs"),
+            ResourceOperation::Create,
+            &[]
+        )
+        .is_err());
         assert_eq!(fs::read_to_string(config).unwrap(), r#"{"keep":"fixture"}"#);
         assert!(!fixture.0.join(".claude.json").exists());
         assert!(!fixture.0.join(".codex/config.toml").exists());
@@ -1040,7 +1332,18 @@ mod tests {
         let registry_path = store(&fixture.0).join("state.json");
         let before = fs::read(&registry_path).unwrap();
         for (selected, remove) in [(Vec::new(), true), (targets(), false), (Vec::new(), false)] {
-            let error = skill_change(&fixture.0, "fixture", None, &selected, remove).unwrap_err();
+            let error = skill_change(
+                &fixture.0,
+                "fixture",
+                None,
+                &selected,
+                if remove {
+                    ResourceOperation::Remove
+                } else {
+                    ResourceOperation::Edit
+                },
+            )
+            .unwrap_err();
             assert!(error.contains(message), "{error}");
             assert_eq!(fingerprint(&files(&cache).unwrap()), cached_hash);
             assert_eq!(
@@ -1062,7 +1365,14 @@ mod tests {
         let fixture = Fixture::new();
         let source = fixture.skill();
         let original_hash = fingerprint(&files(&source).unwrap());
-        skill_change(&fixture.0, "fixture", source.to_str(), &[], false).unwrap();
+        skill_change(
+            &fixture.0,
+            "fixture",
+            source.to_str(),
+            &[],
+            ResourceOperation::Create,
+        )
+        .unwrap();
         assert_eq!(
             registry(&fixture.0).unwrap().skills["fixture"].source_fingerprint,
             Some(original_hash.clone())
@@ -1080,8 +1390,15 @@ mod tests {
         let fixture = Fixture::new();
         let source = fixture.skill();
         let original_hash = fingerprint(&files(&source).unwrap());
-        skill_change(&fixture.0, "fixture", source.to_str(), &targets(), false).unwrap();
-        skill_change(&fixture.0, "fixture", None, &[], false).unwrap();
+        skill_change(
+            &fixture.0,
+            "fixture",
+            source.to_str(),
+            &targets(),
+            ResourceOperation::Create,
+        )
+        .unwrap();
+        skill_change(&fixture.0, "fixture", None, &[], ResourceOperation::Edit).unwrap();
         let state = registry(&fixture.0).unwrap();
         assert!(state.skills["fixture"].targets.is_empty());
         assert_eq!(
@@ -1110,9 +1427,16 @@ mod tests {
         let fixture = Fixture::new();
         let source = fixture.skill();
         let original_hash = fingerprint(&files(&source).unwrap());
-        skill_change(&fixture.0, "fixture", source.to_str(), &targets(), false).unwrap();
+        skill_change(
+            &fixture.0,
+            "fixture",
+            source.to_str(),
+            &targets(),
+            ResourceOperation::Create,
+        )
+        .unwrap();
         remove_source_fingerprint(&fixture);
-        skill_change(&fixture.0, "fixture", None, &[], false).unwrap();
+        skill_change(&fixture.0, "fixture", None, &[], ResourceOperation::Edit).unwrap();
         assert_eq!(
             registry(&fixture.0).unwrap().skills["fixture"].source_fingerprint,
             Some(original_hash.clone())
@@ -1131,7 +1455,14 @@ mod tests {
             let fixture = Fixture::new();
             let source = fixture.skill();
             let original_hash = fingerprint(&files(&source).unwrap());
-            skill_change(&fixture.0, "fixture", source.to_str(), &[], false).unwrap();
+            skill_change(
+                &fixture.0,
+                "fixture",
+                source.to_str(),
+                &[],
+                ResourceOperation::Create,
+            )
+            .unwrap();
             remove_source_fingerprint(&fixture);
             if edited {
                 fs::write(
@@ -1149,7 +1480,14 @@ mod tests {
         let fixture = Fixture::new();
         let source = fixture.skill();
         let occupied = fixture.write(".gemini/skills/fixture/SKILL.md", "Do not overwrite");
-        assert!(skill_change(&fixture.0, "fixture", source.to_str(), &targets(), false).is_err());
+        assert!(skill_change(
+            &fixture.0,
+            "fixture",
+            source.to_str(),
+            &targets(),
+            ResourceOperation::Create
+        )
+        .is_err());
         assert!(!fixture.0.join(".claude/skills/fixture").exists());
         assert!(!store(&fixture.0).exists());
         assert_eq!(fs::read_to_string(occupied).unwrap(), "Do not overwrite");
@@ -1158,11 +1496,11 @@ mod tests {
             "fixture",
             source.to_str(),
             &["codex".into()],
-            false,
+            ResourceOperation::Create,
         )
         .unwrap();
         let modified = fixture.write(".codex/skills/fixture/SKILL.md", "User modification");
-        assert!(skill_change(&fixture.0, "fixture", None, &[], true).is_err());
+        assert!(skill_change(&fixture.0, "fixture", None, &[], ResourceOperation::Remove).is_err());
         assert_eq!(fs::read_to_string(modified).unwrap(), "User modification");
     }
     #[test]
@@ -1170,26 +1508,47 @@ mod tests {
         let fixture = Fixture::new();
         let source = fixture.skill();
         for name in ["../escape", "/absolute", "..", "", "a/b"] {
-            assert!(skill_change(&fixture.0, name, source.to_str(), &targets(), false).is_err());
+            assert!(skill_change(
+                &fixture.0,
+                name,
+                source.to_str(),
+                &targets(),
+                ResourceOperation::Create
+            )
+            .is_err());
         }
         assert!(skill_change(
             &fixture.0,
             "fixture",
             source.to_str(),
             &["unsupported".into()],
-            false
+            ResourceOperation::Create
         )
         .is_err());
-        assert!(skill_change(&fixture.0, "fixture", Some("relative"), &[], false).is_err());
+        assert!(skill_change(
+            &fixture.0,
+            "fixture",
+            Some("relative"),
+            &[],
+            ResourceOperation::Create
+        )
+        .is_err());
         assert!(skill_change(
             &fixture.0,
             "fixture",
             Some(fixture.0.to_str().unwrap()),
             &[],
-            false
+            ResourceOperation::Create
         )
         .is_err());
-        assert!(skill_change(&fixture.0, "fixture", source.to_str(), &[], true).is_err());
+        assert!(skill_change(
+            &fixture.0,
+            "fixture",
+            source.to_str(),
+            &[],
+            ResourceOperation::Remove
+        )
+        .is_err());
         assert!(!store(&fixture.0).exists());
     }
     #[cfg(unix)]
@@ -1204,9 +1563,23 @@ mod tests {
         )
         .unwrap();
         symlink(source.join("SKILL.md"), source.join("linked")).unwrap();
-        assert!(skill_change(&fixture.0, "fixture", source.to_str(), &targets(), false).is_err());
+        assert!(skill_change(
+            &fixture.0,
+            "fixture",
+            source.to_str(),
+            &targets(),
+            ResourceOperation::Create
+        )
+        .is_err());
         fs::remove_file(source.join("linked")).unwrap();
-        skill_change(&fixture.0, "fixture", source.to_str(), &targets(), false).unwrap();
+        skill_change(
+            &fixture.0,
+            "fixture",
+            source.to_str(),
+            &targets(),
+            ResourceOperation::Create,
+        )
+        .unwrap();
         assert_eq!(
             fs::metadata(fixture.0.join(".codex/skills/fixture/scripts/check.sh"))
                 .unwrap()
@@ -1230,7 +1603,14 @@ mod tests {
             r#"{"security":{"trust":true},"mcpServers":{"other":{"command":"other"}}}"#,
         );
         let original = fs::read(&claude).unwrap();
-        mcp_change(&fixture.0, "docs", &entries("docs"), false, &[]).unwrap();
+        mcp_change(
+            &fixture.0,
+            "docs",
+            &entries("docs"),
+            ResourceOperation::Create,
+            &[],
+        )
+        .unwrap();
         assert_eq!(expected(&fixture, "docs").len(), 3);
         let claude_value: Value = serde_json::from_slice(&fs::read(&claude).unwrap()).unwrap();
         assert_eq!(claude_value["projects"]["local"]["trust"], true);
@@ -1245,20 +1625,41 @@ mod tests {
         let gemini_value: Value = serde_json::from_slice(&fs::read(gemini).unwrap()).unwrap();
         assert_eq!(gemini_value["security"]["trust"], true);
         let previous = expected(&fixture, "docs");
-        mcp_change(&fixture.0, "docs", &[], true, &previous).unwrap();
+        mcp_change(
+            &fixture.0,
+            "docs",
+            &[],
+            ResourceOperation::Remove,
+            &previous,
+        )
+        .unwrap();
         assert!(expected(&fixture, "docs").is_empty());
         assert_eq!(expected(&fixture, "other").len(), 3);
     }
     #[test]
     fn per_target_disable_survives_reload_and_enable_restores_secrets() {
         let fixture = Fixture::new();
-        mcp_change(&fixture.0, "docs", &entries("docs"), false, &[]).unwrap();
+        mcp_change(
+            &fixture.0,
+            "docs",
+            &entries("docs"),
+            ResourceOperation::Create,
+            &[],
+        )
+        .unwrap();
         let previous = expected(&fixture, "docs");
         let mut changed = previous.clone();
         for entry in &mut changed {
             entry.enabled = false;
         }
-        mcp_change(&fixture.0, "docs", &changed, false, &previous).unwrap();
+        mcp_change(
+            &fixture.0,
+            "docs",
+            &changed,
+            ResourceOperation::Edit,
+            &previous,
+        )
+        .unwrap();
         let disabled = expected(&fixture, "docs");
         assert_eq!(disabled.len(), 3);
         assert!(disabled.iter().all(|entry| !entry.enabled));
@@ -1274,11 +1675,25 @@ mod tests {
         }
         let mut enabled = disabled.clone();
         enabled[0].enabled = true;
-        mcp_change(&fixture.0, "docs", &enabled, false, &disabled).unwrap();
+        mcp_change(
+            &fixture.0,
+            "docs",
+            &enabled,
+            ResourceOperation::Edit,
+            &disabled,
+        )
+        .unwrap();
         let reloaded = expected(&fixture, "docs");
         assert_eq!(reloaded.iter().filter(|entry| entry.enabled).count(), 1);
         assert_eq!(reloaded[0].spec["env"]["TOKEN"], "fixture");
-        mcp_change(&fixture.0, "docs", &[], true, &reloaded).unwrap();
+        mcp_change(
+            &fixture.0,
+            "docs",
+            &[],
+            ResourceOperation::Remove,
+            &reloaded,
+        )
+        .unwrap();
         assert!(expected(&fixture, "docs").is_empty());
     }
     #[test]
@@ -1288,7 +1703,14 @@ mod tests {
         for entry in &mut remote {
             entry.spec = json!({"type":"http","url":"http://localhost:1234/mcp","headers":{"Authorization":"fixture"}});
         }
-        mcp_change(&fixture.0, "remote", &remote, false, &[]).unwrap();
+        mcp_change(
+            &fixture.0,
+            "remote",
+            &remote,
+            ResourceOperation::Create,
+            &[],
+        )
+        .unwrap();
         let (_, _, gemini) = config(&fixture.0, "gemini").unwrap();
         assert_eq!(
             gemini["mcpServers"]["remote"]["httpUrl"],
@@ -1322,7 +1744,14 @@ mod tests {
             let bad = fixture.write(path, text);
             let before = fs::read(&bad).unwrap();
             assert!(!snapshot(&fixture.0).unwrap().errors.is_empty());
-            assert!(mcp_change(&fixture.0, "docs", &entries("docs"), false, &[]).is_err());
+            assert!(mcp_change(
+                &fixture.0,
+                "docs",
+                &entries("docs"),
+                ResourceOperation::Create,
+                &[]
+            )
+            .is_err());
             assert_eq!(fs::read(bad).unwrap(), before);
             assert!(!store(&fixture.0).join("state.json").exists());
         }
@@ -1330,19 +1759,33 @@ mod tests {
     #[test]
     fn stale_editor_conflicts_invalid_json_and_unsupported_transport_do_not_write() {
         let fixture = Fixture::new();
-        mcp_change(&fixture.0, "docs", &entries("docs"), false, &[]).unwrap();
+        mcp_change(
+            &fixture.0,
+            "docs",
+            &entries("docs"),
+            ResourceOperation::Create,
+            &[],
+        )
+        .unwrap();
         let stale = expected(&fixture, "docs");
         fixture.write(
             ".claude.json",
             r#"{"mcpServers":{"docs":{"type":"stdio","command":"changed"}}}"#,
         );
-        assert!(mcp_change(&fixture.0, "docs", &entries("docs"), false, &stale).is_err());
+        assert!(mcp_change(
+            &fixture.0,
+            "docs",
+            &entries("docs"),
+            ResourceOperation::Edit,
+            &stale
+        )
+        .is_err());
         let before = fs::read(fixture.0.join(".claude.json")).unwrap();
         let mut invalid = entries("new");
         invalid[1].spec = json!({"type":"sse","url":"http://localhost/events"});
-        assert!(mcp_change(&fixture.0, "new", &invalid, false, &[]).is_err());
+        assert!(mcp_change(&fixture.0, "new", &invalid, ResourceOperation::Create, &[]).is_err());
         invalid[1].spec = json!({"type":"stdio","command":"fixture","env":{"TOKEN":false}});
-        assert!(mcp_change(&fixture.0, "new", &invalid, false, &[]).is_err());
+        assert!(mcp_change(&fixture.0, "new", &invalid, ResourceOperation::Create, &[]).is_err());
         assert_eq!(fs::read(fixture.0.join(".claude.json")).unwrap(), before);
     }
     #[test]
@@ -1350,7 +1793,14 @@ mod tests {
         let fixture = Fixture::new();
         let claude = fixture.write(".claude.json", "{\"unknown\":true}");
         fixture.write(".gemini/settings.ecpa-tmp", "occupied temporary file");
-        assert!(mcp_change(&fixture.0, "docs", &entries("docs"), false, &[]).is_err());
+        assert!(mcp_change(
+            &fixture.0,
+            "docs",
+            &entries("docs"),
+            ResourceOperation::Create,
+            &[]
+        )
+        .is_err());
         assert_eq!(fs::read_to_string(claude).unwrap(), "{\"unknown\":true}");
         assert!(!fixture.0.join(".codex/config.toml").exists());
         assert!(!store(&fixture.0).join("state.json").exists());

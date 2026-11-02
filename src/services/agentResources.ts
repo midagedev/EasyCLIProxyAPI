@@ -8,8 +8,9 @@ export type McpSpec = Record<string, unknown>;
 export type McpEntry = { id: string; agent: ResourceAgent; enabled: boolean; spec: McpSpec };
 export type ResourceSnapshot = { skills: LocalSkill[]; mcp: McpEntry[]; errors: string[] };
 export const getAgentResources = () => invoke<ResourceSnapshot>('get_agent_resources');
-export const updateAgentSkill = (name: string, source: string | null, targets: ResourceAgent[], remove = false) => invoke<void>('update_agent_skill', { name, source, targets, remove });
-export const updateAgentMcp = (id: string, entries: McpEntry[], expected: McpEntry[], remove = false) => invoke<void>('update_agent_mcp', { id, entries, expected, remove });
+export type ResourceOperation = 'create' | 'edit' | 'remove';
+export const updateAgentSkill = (name: string, source: string | null, targets: ResourceAgent[], operation: ResourceOperation) => invoke<void>('update_agent_skill', { name, source, targets, operation });
+export const updateAgentMcp = (id: string, entries: McpEntry[], expected: McpEntry[], operation: ResourceOperation) => invoke<void>('update_agent_mcp', { id, entries, expected, operation });
 export const SECRET_MASK = '••••••••';
 
 export function displayMcpSpec(spec: McpSpec, reveal: boolean): string {
