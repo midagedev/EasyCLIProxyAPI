@@ -560,16 +560,6 @@ fn prepare_catalog_with_customizations(
         return Err("CPA currently has no valid Codex model ID".to_string());
     }
 
-    for entry in &mut entries {
-        entry.value.insert("supports_parallel_tool_calls".to_string(), Value::Bool(true));
-        customizations::apply_customizations(&mut entry.value, customizations)?;
-    }
-
-    for entry in &entries {
-        let slug = string_value(&entry.value, "slug");
-        validate_required_codex_fields(&entry.value, &slug)?;
-    }
-
     let mut fallback_indexes = entries
         .iter()
         .enumerate()
@@ -590,16 +580,14 @@ fn prepare_catalog_with_customizations(
         );
     }
 
-    entries.sort_by(
-        |left, right| match (left.template_order, right.template_order) {
-            (Some(left_order), Some(right_order)) => priority_value(&left.value)
-                .cmp(&priority_value(&right.value))
-                .then_with(|| left_order.cmp(&right_order)),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => priority_value(&left.value).cmp(&priority_value(&right.value)),
-        },
-    );
+    entries.sort_by_key(|entry| (priority_value(&entry.value), entry.template_order));
+    for entry in &mut entries {
+        entry.value.insert("supports_parallel_tool_calls".to_string(), Value::Bool(true));
+        customizations::apply_customizations(&mut entry.value, customizations)?;
+        let slug = string_value(&entry.value, "slug");
+        validate_required_codex_fields(&entry.value, &slug)?;
+    }
+    entries.sort_by_key(|entry| priority_value(&entry.value));
 
     let models = entries
         .iter()

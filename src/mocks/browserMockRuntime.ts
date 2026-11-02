@@ -618,8 +618,9 @@ function createState(scenario: BrowserMockScenario) {
     codexCatalog: {
       defaultAutoReviewModel: null as string | null,
       revision: 'mock-catalog-r1',
-      models: ['gpt-5.2-codex', 'gpt-5.1-codex'].map((slug) => {
+      models: ['gpt-5.2-codex', 'gpt-5.1-codex'].map((slug, index) => {
         const configuration = {
+          priority: index * 100,
           display_name: slug === 'gpt-5.2-codex' ? 'GPT-5.2 Codex' : 'GPT-5.1 Codex',
           description: 'Browser Mock model catalog',
           context_window: 272_000,
@@ -636,6 +637,7 @@ function createState(scenario: BrowserMockScenario) {
         };
         return {
           slug,
+          defaultOrder: index,
           hasOfficialTemplate: true,
           contextSource: 'template',
           customized: false,
@@ -1559,8 +1561,9 @@ export function createBrowserMockRuntime(
         const models = asArray(request.models).map(asObject);
         state.codexCatalog.models = state.codexCatalog.models.map((model) => {
           const update = models.find((item) => item.slug === model.slug);
-          return update ? { ...model, configuration: clone(asObject(update.configuration)) as typeof model.configuration, customized: true } : model;
-        });
+          const configuration = update ? clone(asObject(update.configuration)) as typeof model.configuration : model.configuration;
+          return { ...model, configuration, customized: JSON.stringify(configuration) !== JSON.stringify(model.defaults) };
+        }).sort((left, right) => left.configuration.priority - right.configuration.priority || left.defaultOrder - right.defaultOrder);
         state.codexCatalog.revision = `mock-catalog-${Date.now()}`;
         return { snapshot: clone(state.codexCatalog), synchronizationError: null };
       }

@@ -2,6 +2,8 @@ import { describe, expect, test } from 'bun:test';
 import {
   cloneCodexModelConfiguration,
   codexContextSourceHint,
+  parseCodexModelPriority,
+  sortCodexCatalogModels,
   sameCodexModelConfiguration,
   toggleCodexReasoningLevel,
   validateCodexModelConfiguration,
@@ -10,6 +12,7 @@ import {
 } from '../src/services/codexModelCatalog';
 
 const configuration = (): CodexModelConfiguration => ({
+  priority: 100,
   display_name: 'Third Party',
   description: null,
   base_instructions: 'You are a helpful coding assistant.',
@@ -30,6 +33,34 @@ const configuration = (): CodexModelConfiguration => ({
 });
 
 describe('Codex 模型列表编辑', () => {
+  test('priority is signed, safe, dirty-tracked and rejects empty editing', () => {
+    const original = configuration();
+    for (const priority of [-Number.MAX_SAFE_INTEGER, -1, 0, Number.MAX_SAFE_INTEGER]) {
+      expect(validateCodexModelConfiguration({ ...original, priority })).toBeNull();
+      expect(sameCodexModelConfiguration(original, { ...original, priority })).toBe(false);
+    }
+    for (const priority of [0.5, NaN, Infinity, -Infinity, Number.MAX_SAFE_INTEGER + 1, Number.MIN_SAFE_INTEGER - 1, parseCodexModelPriority(''), parseCodexModelPriority('-')]) {
+      expect(validateCodexModelConfiguration({ ...original, priority })).toBe('agents.catalog.invalidPriority');
+    }
+    expect(parseCodexModelPriority('0')).toBe(0);
+    expect(sameCodexModelConfiguration(original, cloneCodexModelConfiguration(original))).toBe(true);
+  });
+
+  test('priority preview is stable, non-mutating and resets to defaults', () => {
+    const makeModel = (slug: string, priority: number, defaultOrder: number): CodexCatalogEditorModel => ({
+      slug, defaultOrder, hasOfficialTemplate: true, contextSource: 'template', customized: false,
+      configuration: { ...configuration(), priority }, defaults: { ...configuration(), priority },
+    });
+    const models = [makeModel('first', 0, 0), makeModel('second', 100, 1), makeModel('third', 100, 2)];
+    models[2].configuration.priority = -10;
+    expect(sortCodexCatalogModels(models).map(model => model.slug)).toEqual(['third', 'first', 'second']);
+    expect(models[0].slug).toBe('first');
+    models[2].configuration = cloneCodexModelConfiguration(models[2].defaults);
+    expect(sortCodexCatalogModels(models).map(model => model.slug)).toEqual(['first', 'second', 'third']);
+    expect(sortCodexCatalogModels([models[2], models[1], models[0]]).map(model => model.slug)).toEqual(['first', 'second', 'third']);
+    models[1].configuration.priority = NaN;
+    expect(sortCodexCatalogModels(models).map(model => model.slug)).toEqual(['first', 'second', 'third']);
+  });
   test('仅修改 Tool Search 也能触发保存，并可恢复默认值', () => {
     const original = configuration();
     const edited = cloneCodexModelConfiguration(original);
@@ -49,7 +80,7 @@ describe('Codex 模型列表编辑', () => {
   });
   test("区分 Codex 客户端 API、模板后备与自定义上下文", () => {
     const model: CodexCatalogEditorModel = {
-      slug: "model-a", hasOfficialTemplate: true, customized: false,
+      slug: "model-a", defaultOrder: 0, hasOfficialTemplate: true, customized: false,
       contextSource: "client", configuration: configuration(), defaults: configuration(),
     };
     expect(codexContextSourceHint(model)).toBe("agents.catalog.contextSource.client");

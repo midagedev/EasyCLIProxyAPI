@@ -6,6 +6,9 @@ import { authFileListEn } from '../authFileList';
 import { themeDiyEn } from '../themeDiy';
 
 export const en: Record<MessageKey, string> = {
+  'agents.catalog.priority': 'Display priority',
+  'agents.catalog.priorityHint': 'Lower numbers appear earlier. Display order only; does not affect credential routing or request service tier.',
+  'agents.catalog.invalidPriority': 'Display priority must be an integer between -9007199254740991 and 9007199254740991.',
   ...routingEn,
   ...themeDiyEn,
   'app.window.minimize': 'Minimize',

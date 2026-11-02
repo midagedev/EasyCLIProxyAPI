@@ -10,7 +10,8 @@ pub(super) struct ModelCustomizations {
     models: BTreeMap<String, Map<String, Value>>,
 }
 
-pub(super) const EDITABLE_FIELDS: [&str; 13] = [
+pub(super) const EDITABLE_FIELDS: [&str; 14] = [
+    "priority",
     "display_name",
     "description",
     "base_instructions",
@@ -47,6 +48,7 @@ pub(crate) struct CatalogEditorSnapshot {
 #[serde(rename_all = "camelCase")]
 struct CatalogEditorModel {
     slug: String,
+    default_order: usize,
     has_official_template: bool,
     context_source: &'static str,
     customized: bool,
@@ -104,6 +106,11 @@ fn editable_configuration(model: &Map<String, Value>) -> Map<String, Value> {
 }
 
 fn validate_configuration(model: &Map<String, Value>) -> Result<(), String> {
+    if let Some(value) = model.get("priority") {
+        if !value.as_i64().is_some_and(|priority| (-9_007_199_254_740_991..=9_007_199_254_740_991).contains(&priority)) {
+            return Err("Priority must be a signed safe integer".to_string());
+        }
+    }
     if let Some(value) = model.get("base_instructions") {
         if !value.as_str().is_some_and(|text| !text.trim().is_empty()) {
             return Err("System prompt must be non-empty text".to_string());
@@ -276,6 +283,7 @@ pub(super) fn snapshot_for_state(
         let defaults = editable_configuration(&model);
         apply_customizations(&mut model, &state.customizations)?;
         models.push(CatalogEditorModel {
+            default_order: models.len(),
             has_official_template: state.sources.template_for_slug(&slug).is_some(),
             slug,
             context_source: runtime_models
@@ -287,6 +295,7 @@ pub(super) fn snapshot_for_state(
             defaults,
         });
     }
+    models.sort_by_key(|model| priority_value(&model.configuration));
     let mut digest = Sha256::new();
     digest.update(baseline.as_bytes());
     digest.update(serde_json::to_vec(&state.customizations).map_err(|error| error.to_string())?);
@@ -469,6 +478,89 @@ mod tests {
             std::process::id(),
             SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ))
+    }
+
+    #[test]
+    fn priority_order_persists_reloads_and_resets_for_all_model_kinds() {
+        let mut state = CatalogState {
+            sources: parse_sources(MODEL_CATALOG_JSON).unwrap(),
+            json: MODEL_CATALOG_JSON.to_string(),
+            customizations: Default::default(),
+        };
+        let runtime = vec![runtime_model("z-custom"), runtime_model("gpt-6-astra"), runtime_model("a-custom"), runtime_model("Fy/gpt-6.1-sol")];
+        let original = snapshot_for_state(&runtime, &state).unwrap();
+        let original_order = original.models.iter().map(|model| model.slug.clone()).collect::<Vec<_>>();
+        assert_eq!(original_order, ["Fy/gpt-6.1-sol", "gpt-6-astra", "a-custom", "z-custom"]);
+        assert!(original_order.iter().position(|slug| slug == "a-custom") < original_order.iter().position(|slug| slug == "z-custom"));
+        let path = temporary_path();
+        let requests = original.models.iter().map(|model| {
+            let mut configuration = model.configuration.clone();
+            if model.slug != "gpt-6-astra" {
+                configuration.insert("priority".into(), Value::from(-100));
+            }
+            if model.slug == "z-custom" {
+                configuration.insert("display_name".into(), Value::from("AAA renamed"));
+            }
+            CatalogEditorModelRequest { slug: model.slug.clone(), configuration }
+        }).collect();
+        let saved = save_for_state(&path, &runtime, CatalogEditorRequest {
+            review_model: None, revision: original.revision, models: requests,
+        }, &mut state).unwrap();
+        let restarted = CatalogState {
+            customizations: decode_customizations(&std::fs::read(&path).unwrap()).unwrap(),
+            ..state.clone()
+        };
+        for current in [&state, &restarted] {
+            let prepared = prepare_catalog_with_customizations(&runtime, &current.sources, &current.customizations).unwrap();
+            let generated: Value = serde_json::from_str(&prepared.json).unwrap();
+            let snapshot = snapshot_for_state(&runtime, current).unwrap();
+            for (index, model) in snapshot.models.iter().enumerate() {
+                assert_eq!(generated["models"][index]["slug"], model.slug);
+                assert_eq!(prepared.models[index].name, model.slug);
+                let defaults = &original.models.iter().find(|baseline| baseline.slug == model.slug).unwrap().defaults;
+                assert_eq!(&model.defaults, defaults);
+            }
+            assert_eq!(snapshot.models.last().unwrap().slug, "gpt-6-astra");
+            assert!(snapshot.models.iter().take(3).all(|model| model.configuration["priority"] == -100));
+        }
+        save_for_state(&path, &runtime, CatalogEditorRequest {
+            review_model: None, revision: saved.revision,
+            models: saved.models.iter().map(|model| CatalogEditorModelRequest {
+                slug: model.slug.clone(), configuration: model.defaults.clone(),
+            }).collect(),
+        }, &mut state).unwrap();
+        assert!(state.customizations.models.is_empty());
+        assert_eq!(snapshot_for_state(&runtime, &state).unwrap().models.iter().map(|model| model.slug.clone()).collect::<Vec<_>>(), original_order);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn invalid_priority_save_preserves_state_and_legacy_files_remain_readable() {
+        assert!(decode_customizations(br#"{"version":1,"models":{"unavailable":{"description":"legacy"}}}"#).is_ok());
+        for priority in [serde_json::json!(0.5), serde_json::json!(9_007_199_254_740_992_i64), serde_json::json!(-9_007_199_254_740_992_i64), Value::Null, Value::from(""), Value::from("NaN")] {
+            let mut state = CatalogState {
+                sources: parse_sources(MODEL_CATALOG_JSON).unwrap(),
+                json: MODEL_CATALOG_JSON.to_string(), customizations: Default::default(),
+            };
+            let runtime = vec![runtime_model("unknown")];
+            let snapshot = snapshot_for_state(&runtime, &state).unwrap();
+            let mut configuration = snapshot.models[0].configuration.clone();
+            configuration.insert("priority".into(), priority);
+            let path = temporary_path();
+            std::fs::write(&path, b"unchanged").unwrap();
+            let revision = snapshot.revision.clone();
+            assert!(save_for_state(&path, &runtime, CatalogEditorRequest {
+                review_model: None, revision: snapshot.revision,
+                models: vec![CatalogEditorModelRequest { slug: "unknown".into(), configuration }],
+            }, &mut state).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), b"unchanged");
+            assert_eq!(snapshot_for_state(&runtime, &state).unwrap().revision, revision);
+            assert!(state.customizations.models.is_empty());
+            std::fs::remove_file(path).unwrap();
+        }
+        for priority in [-9_007_199_254_740_991_i64, -1, 0, 9_007_199_254_740_991_i64] {
+            assert!(validate_configuration(serde_json::json!({"priority":priority}).as_object().unwrap()).is_ok());
+        }
     }
 
     #[test]
@@ -657,6 +749,7 @@ mod tests {
             customizations: Default::default(),
         };
         let hidden = serde_json::json!({
+            "priority": -50,
             "base_instructions": "Saved prompt for temporarily unavailable A",
             "context_window": 131_072,
             "max_context_window": 262_144,

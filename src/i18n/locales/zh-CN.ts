@@ -5,6 +5,9 @@ import { authFileListZhCN } from '../authFileList';
 import { themeDiyZhCN } from '../themeDiy';
 
 export const zhCN = {
+  'agents.catalog.priority': '显示优先级',
+  'agents.catalog.priorityHint': '数值越小，显示越靠前。仅影响显示顺序，不影响凭证路由或请求服务等级。',
+  'agents.catalog.invalidPriority': '显示优先级必须是 -9007199254740991 到 9007199254740991 之间的整数。',
   ...routingZhCN,
   ...themeDiyZhCN,
   'app.window.minimize': '最小化',
