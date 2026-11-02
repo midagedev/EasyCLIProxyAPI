@@ -1,4 +1,5 @@
 import { routingZhTW } from './locales/routing';
+import { agentResourcesZhTW } from './agentResources';
 import { createTraditionalMessages } from './traditional';
 import { themeDiyZhTW } from './themeDiy';
 import { authFileTagsZhTW } from './authFileList';
@@ -12,6 +13,7 @@ export type MessageVariables = Record<string, string | number>;
 
 export const zhTW: Record<MessageKey, string> = {
   ...createTraditionalMessages(zhCN),
+  ...agentResourcesZhTW,
   ...routingZhTW,
   ...themeDiyZhTW,
   ...authFileTagsZhTW,

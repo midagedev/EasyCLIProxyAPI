@@ -1,0 +1,27 @@
+.agent-management-page { min-width: 0; }
+.resource-page { display: flex; flex-direction: column; gap: 18px; min-width: 0; padding: 22px; }
+.resource-heading h1 { margin: 0 0 8px; font-size: 24px; }
+.resource-heading p { margin: 0; color: var(--text-secondary); overflow-wrap: anywhere; line-height: 1.6; }
+.resource-toolbar, .resource-actions, .resource-card-heading, .resource-statuses { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.resource-search { display: flex; align-items: center; gap: 8px; flex: 1 1 240px; }
+.resource-search input { width: 100%; min-width: 0; }
+.resource-list { display: grid; gap: 14px; }
+.resource-card { padding: 20px; min-width: 0; }
+.resource-card-heading { justify-content: space-between; }
+.resource-card h2 { font-size: 17px; margin: 0 0 6px; overflow-wrap: anywhere; }
+.resource-card p, .resource-card-heading span { color: var(--text-secondary); }
+.resource-card p, .resource-path { overflow-wrap: anywhere; }
+.resource-path { display: block; font-size: 12px; margin: 5px 0; }
+.resource-statuses { margin-top: 16px; }
+.resource-statuses span { padding: 6px 10px; border: 1px solid var(--border-color); border-radius: var(--radius-sm); font-size: 12px; color: var(--text-secondary); }
+.resource-statuses [data-enabled="true"] { color: var(--text-primary); background: var(--bg-secondary); }
+.resource-empty { padding: 44px 20px; text-align: center; color: var(--text-secondary); border: 1px dashed var(--border-color); border-radius: var(--radius-lg); }
+.config-dialog.resource-editor { display: block; width: min(760px, calc(100vw - 40px)); height: auto; max-height: calc(100dvh - 40px); overflow-y: auto; box-sizing: border-box; }
+.resource-editor label:not(.resource-check) { display: flex; flex-direction: column; gap: 8px; margin: 12px 0; }
+.resource-editor input:not([type="checkbox"]), .resource-editor textarea { width: 100%; min-width: 0; box-sizing: border-box; }
+.resource-editor textarea { resize: vertical; font-family: monospace; line-height: 1.5; }
+.resource-editor fieldset { margin-top: 18px; border: 1px solid var(--border-color); border-radius: var(--radius-md); padding: 12px; min-width: 0; }
+.resource-target { border-bottom: 1px solid var(--border-color); padding: 12px 0; }
+.resource-target:last-child { border-bottom: 0; }
+.resource-check { display: flex; align-items: center; gap: 10px; margin: 6px 0; }
+@media (max-width: 640px) { .resource-page { padding: 14px; } .resource-toolbar > button { flex: 1; } .resource-card { padding: 14px; } }

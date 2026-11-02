@@ -1,0 +1,1235 @@
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Component, Path, PathBuf},
+    sync::Mutex,
+};
+use tauri::Manager;
+
+static LOCK: Mutex<()> = Mutex::new(());
+const AGENTS: [&str; 3] = ["claude", "codex", "gemini"];
+type Result<T> = std::result::Result<T, String>;
+
+#[derive(Default, Serialize, Deserialize)]
+struct Registry {
+    #[serde(default)]
+    skills: BTreeMap<String, ManagedSkill>,
+    #[serde(default)]
+    disabled: BTreeMap<String, BTreeMap<String, Value>>,
+}
+#[derive(Serialize, Deserialize)]
+struct ManagedSkill {
+    source: String,
+    targets: BTreeMap<String, String>,
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Skill {
+    name: String,
+    description: String,
+    paths: Vec<String>,
+    source: Option<String>,
+    managed: bool,
+    installed: BTreeMap<String, bool>,
+    owned: BTreeMap<String, bool>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+pub struct McpEntry {
+    pub id: String,
+    pub agent: String,
+    pub enabled: bool,
+    pub spec: Value,
+}
+#[derive(Serialize)]
+pub struct Snapshot {
+    skills: Vec<Skill>,
+    mcp: Vec<McpEntry>,
+    errors: Vec<String>,
+}
+
+fn valid_id(id: &str) -> Result<()> {
+    if id.is_empty()
+        || id.len() > 100
+        || id == "."
+        || id == ".."
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+    {
+        return Err(
+            "Use 1–100 letters, numbers, dots, underscores or hyphens for the identifier".into(),
+        );
+    }
+    Ok(())
+}
+fn agent_dir(home: &Path, agent: &str) -> Result<PathBuf> {
+    match agent {
+        "claude" => Ok(home.join(".claude")),
+        "codex" => Ok(home.join(".codex")),
+        "gemini" => Ok(home.join(".gemini")),
+        _ => Err("Unsupported target".into()),
+    }
+}
+fn store(home: &Path) -> PathBuf {
+    home.join(".config/easy-cli-proxy-api/agent-resources")
+}
+fn no_links(path: &Path) -> Result<()> {
+    for ancestor in path.ancestors() {
+        if ancestor
+            .components()
+            .any(|part| matches!(part, Component::ParentDir))
+        {
+            return Err("Parent traversal is not allowed".into());
+        }
+        match fs::symlink_metadata(ancestor) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err("Symbolic links are not writable managed paths".into())
+            }
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                return Err("Cannot inspect managed path".into())
+            }
+            _ => (),
+        }
+    }
+    Ok(())
+}
+fn read(path: &Path) -> Result<Option<Vec<u8>>> {
+    no_links(path)?;
+    match fs::read(path) {
+        Ok(bytes) if bytes.len() <= 8 * 1024 * 1024 => Ok(Some(bytes)),
+        Ok(_) => Err("Configuration exceeds 8 MiB".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err("Cannot read configuration".into()),
+    }
+}
+fn registry(home: &Path) -> Result<Registry> {
+    match read(&store(home).join("state.json"))? {
+        Some(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|_| "Invalid resource registry; nothing was changed".into()),
+        None => Ok(Registry::default()),
+    }
+}
+fn atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    no_links(path)?;
+    let parent = path.parent().ok_or("Missing parent")?;
+    fs::create_dir_all(parent).map_err(|_| "Cannot create configuration directory")?;
+    let temporary = path.with_extension("ecpa-tmp");
+    no_links(&temporary)?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&temporary)
+        .map_err(|_| "Cannot create temporary file; check for a stale .ecpa-tmp file")?;
+    let result = (|| {
+        file.write_all(bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(|_| "Cannot write temporary configuration")?;
+        drop(file);
+        #[cfg(windows)]
+        let renamed = crate::core_config::replace_file_atomically(&temporary, path);
+        #[cfg(not(windows))]
+        let renamed = fs::rename(&temporary, path);
+        renamed.map_err(|_| "Cannot replace configuration")
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result.map_err(str::to_string)
+}
+fn save_registry(home: &Path, state: &Registry) -> Result<()> {
+    atomic(
+        &store(home).join("state.json"),
+        &serde_json::to_vec_pretty(state).map_err(|_| "Cannot serialize registry")?,
+    )
+}
+#[derive(Clone)]
+struct SkillFile {
+    bytes: Vec<u8>,
+    permissions: fs::Permissions,
+}
+fn files(directory: &Path) -> Result<BTreeMap<PathBuf, SkillFile>> {
+    fn walk(
+        root: &Path,
+        current: &Path,
+        depth: usize,
+        result: &mut BTreeMap<PathBuf, SkillFile>,
+        total: &mut usize,
+    ) -> Result<()> {
+        no_links(current)?;
+        if depth > 20 {
+            return Err("Skill directory is too deep".into());
+        }
+        for entry in fs::read_dir(current).map_err(|_| "Cannot read skill directory")? {
+            let path = entry.map_err(|_| "Cannot read skill entry")?.path();
+            no_links(&path)?;
+            if path.is_dir() {
+                walk(root, &path, depth + 1, result, total)?;
+            } else if path.is_file() {
+                let size = fs::metadata(&path)
+                    .map_err(|_| "Cannot inspect skill file")?
+                    .len();
+                if size > 32 * 1024 * 1024
+                    || *total as u64 + size > 32 * 1024 * 1024
+                    || result.len() >= 2000
+                {
+                    return Err("Skill exceeds 32 MiB or 2000 files".into());
+                }
+                let content = fs::read(&path).map_err(|_| "Cannot read skill file")?;
+                *total += content.len();
+                let permissions = fs::metadata(&path)
+                    .map_err(|_| "Cannot inspect skill permissions")?
+                    .permissions();
+                result.insert(
+                    path.strip_prefix(root)
+                        .map_err(|_| "Invalid skill path")?
+                        .to_path_buf(),
+                    SkillFile {
+                        bytes: content,
+                        permissions,
+                    },
+                );
+            } else {
+                return Err("Special files are not supported in skills".into());
+            }
+        }
+        Ok(())
+    }
+    let mut result = BTreeMap::new();
+    walk(directory, directory, 0, &mut result, &mut 0)?;
+    if !result.contains_key(Path::new("SKILL.md")) {
+        return Err("Skill directory must contain SKILL.md".into());
+    }
+    Ok(result)
+}
+fn fingerprint(content: &BTreeMap<PathBuf, SkillFile>) -> String {
+    let mut digest = Sha256::new();
+    for (path, file) in content {
+        let name = path.to_string_lossy();
+        digest.update((name.len() as u64).to_le_bytes());
+        digest.update(name.as_bytes());
+        digest.update((file.bytes.len() as u64).to_le_bytes());
+        digest.update(&file.bytes);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            digest.update((file.permissions.mode() & 0o777).to_le_bytes());
+        }
+    }
+    format!("{:x}", digest.finalize())
+}
+fn publish_skill(source: &Path, destination: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let source = std::ffi::CString::new(source.as_os_str().as_bytes())
+            .map_err(|_| "Invalid skill path")?;
+        let destination = std::ffi::CString::new(destination.as_os_str().as_bytes())
+            .map_err(|_| "Invalid skill path")?;
+        #[cfg(target_os = "linux")]
+        let outcome = unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                source.as_ptr(),
+                libc::AT_FDCWD,
+                destination.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        #[cfg(target_os = "macos")]
+        let outcome =
+            unsafe { libc::renamex_np(source.as_ptr(), destination.as_ptr(), libc::RENAME_EXCL) };
+        if outcome != 0 {
+            return Err("Cannot publish skill; destination may already exist".into());
+        }
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        fs::rename(source, destination)
+            .map_err(|_| "Cannot publish skill; destination may already exist".into())
+    }
+}
+fn copy_skill(destination: &Path, content: &BTreeMap<PathBuf, SkillFile>) -> Result<()> {
+    no_links(destination)?;
+    if destination.exists() {
+        return Err("Skill target already exists; no files were overwritten".into());
+    }
+    let staging = destination.with_extension("ecpa-stage");
+    no_links(&staging)?;
+    fs::create_dir_all(destination.parent().ok_or("Missing skill parent")?)
+        .map_err(|_| "Cannot create skill parent")?;
+    fs::create_dir(&staging)
+        .map_err(|_| "Skill staging directory already exists or is not writable")?;
+    let outcome = (|| {
+        for (relative, file) in content {
+            let path = staging.join(relative);
+            atomic(&path, &file.bytes)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(
+                    &path,
+                    fs::Permissions::from_mode(file.permissions.mode() & 0o777),
+                )
+                .map_err(|_| "Cannot preserve skill permissions")?;
+            }
+        }
+        publish_skill(&staging, destination)
+    })();
+    if outcome.is_err() {
+        let _ = fs::remove_dir_all(staging);
+    }
+    outcome
+}
+fn description(path: &Path) -> String {
+    let Ok(Some(bytes)) = read(&path.join("SKILL.md")) else {
+        return String::new();
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    let text = text.trim_start_matches('\u{feff}').replace("\r\n", "\n");
+    text.strip_prefix("---\n")
+        .and_then(|body| body.split_once("\n---"))
+        .and_then(|(front, _)| serde_yaml::from_str::<Value>(front).ok())
+        .and_then(|front| {
+            front
+                .get("description")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_default()
+}
+fn skills(home: &Path, state: &Registry, errors: &mut Vec<String>) -> Vec<Skill> {
+    let mut rows = BTreeMap::<String, Skill>::new();
+    for (name, managed) in &state.skills {
+        rows.insert(
+            name.clone(),
+            Skill {
+                name: name.clone(),
+                description: description(&store(home).join("skills").join(name)),
+                paths: vec![store(home).join("skills").join(name).display().to_string()],
+                source: Some(managed.source.clone()),
+                managed: true,
+                installed: BTreeMap::new(),
+                owned: BTreeMap::new(),
+            },
+        );
+    }
+    for agent in AGENTS {
+        let directory = agent_dir(home, agent).unwrap().join("skills");
+        if !directory.exists() {
+            continue;
+        }
+        if no_links(&directory).is_err() {
+            errors.push(format!("{agent}: symbolic Skills directory is unavailable"));
+            continue;
+        }
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(_) => {
+                errors.push(format!("{agent}: cannot read Skills directory"));
+                continue;
+            }
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.join("SKILL.md").is_file() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if valid_id(&name).is_err() {
+                errors.push(format!("{agent}: unsupported skill directory name"));
+                continue;
+            }
+            let row = rows.entry(name.clone()).or_insert_with(|| Skill {
+                name: name.clone(),
+                description: description(&path),
+                paths: Vec::new(),
+                source: None,
+                managed: false,
+                installed: BTreeMap::new(),
+                owned: BTreeMap::new(),
+            });
+            row.paths.push(path.display().to_string());
+            row.installed.insert(agent.into(), true);
+            row.owned.insert(
+                agent.into(),
+                state
+                    .skills
+                    .get(&name)
+                    .is_some_and(|skill| skill.targets.contains_key(agent)),
+            );
+        }
+    }
+    rows.into_values().collect()
+}
+
+fn skill_change(
+    home: &Path,
+    name: &str,
+    source: Option<&str>,
+    targets: &[String],
+    remove: bool,
+) -> Result<()> {
+    valid_id(name)?;
+    for agent in targets {
+        agent_dir(home, agent)?;
+    }
+    let mut state = registry(home)?;
+    let cache = store(home).join("skills").join(name);
+    no_links(&cache)?;
+    let importing = !state.skills.contains_key(name);
+    if remove && importing {
+        return Err("Unmanaged source directories cannot be removed".into());
+    }
+    let source_path = if importing {
+        let path = PathBuf::from(source.ok_or("Select a source directory")?);
+        if !path.is_absolute() {
+            return Err("Source must be an absolute directory path".into());
+        }
+        no_links(&path)?;
+        if cache.starts_with(&path) || path.starts_with(store(home)) {
+            return Err("Source overlaps managed storage".into());
+        }
+        path
+    } else {
+        cache.clone()
+    };
+    let content = files(&source_path)?;
+    let hash = fingerprint(&content);
+    let previous = state
+        .skills
+        .get(name)
+        .map(|skill| skill.targets.clone())
+        .unwrap_or_default();
+    if previous.values().any(|expected| *expected != hash) {
+        return Err("Managed source changed externally; import it under a new identifier".into());
+    }
+    let mut additions = Vec::new();
+    let mut removals = Vec::new();
+    for agent in AGENTS {
+        let path = agent_dir(home, agent)?.join("skills").join(name);
+        no_links(&path)?;
+        let wanted = !remove && targets.iter().any(|target| target == agent);
+        if let Some(expected) = previous.get(agent) {
+            if path.exists() && fingerprint(&files(&path)?) != *expected {
+                return Err(format!(
+                    "{agent}: managed copy changed externally; no files were removed"
+                ));
+            }
+            if !wanted && path.exists() {
+                removals.push(path.clone());
+            }
+            if wanted && !path.exists() {
+                additions.push(path);
+            }
+        } else if wanted {
+            if path.exists() {
+                return Err(format!(
+                    "{agent}: an unmanaged skill already occupies this name"
+                ));
+            }
+            additions.push(path);
+        }
+    }
+    if importing && cache.exists() {
+        return Err("Managed source already exists".into());
+    }
+    if remove {
+        removals.push(cache.clone());
+    }
+    for path in &removals {
+        let backup = path.with_extension("ecpa-remove");
+        no_links(&backup)?;
+        if backup.exists() {
+            return Err("Pending skill cleanup exists; no files were changed".into());
+        }
+    }
+    let mut created = Vec::new();
+    let mut removed = Vec::new();
+    let outcome = (|| {
+        if importing {
+            copy_skill(&cache, &content)?;
+            created.push(cache.clone());
+        }
+        for path in additions {
+            copy_skill(&path, &content)?;
+            created.push(path);
+        }
+        for path in removals {
+            let backup = path.with_extension("ecpa-remove");
+            publish_skill(&path, &backup)?;
+            removed.push((path, backup));
+        }
+        if remove {
+            state.skills.remove(name);
+        } else {
+            state.skills.insert(
+                name.into(),
+                ManagedSkill {
+                    source: state
+                        .skills
+                        .get(name)
+                        .map(|skill| skill.source.clone())
+                        .unwrap_or_else(|| source_path.display().to_string()),
+                    targets: targets
+                        .iter()
+                        .map(|agent| (agent.clone(), hash.clone()))
+                        .collect(),
+                },
+            );
+        }
+        save_registry(home, &state)
+    })();
+    if outcome.is_err() {
+        let mut failed = false;
+        for path in created {
+            if files(&path).is_ok_and(|content| fingerprint(&content) == hash) {
+                failed |= fs::remove_dir_all(path).is_err();
+            } else {
+                failed = true;
+            }
+        }
+        for (path, backup) in removed.into_iter().rev() {
+            failed |= publish_skill(&backup, &path).is_err();
+        }
+        if failed {
+            return Err("Skill save failed and rollback was incomplete; retained .ecpa-remove directories contain prior copies".into());
+        }
+    } else {
+        for (_, backup) in removed {
+            fs::remove_dir_all(backup)
+                .map_err(|_| "Changes saved; cleanup of a .ecpa-remove directory failed")?;
+        }
+    }
+    outcome
+}
+
+fn config_path(home: &Path, agent: &str) -> Result<PathBuf> {
+    match agent {
+        "claude" => Ok(home.join(".claude.json")),
+        "codex" => Ok(agent_dir(home, agent)?.join("config.toml")),
+        "gemini" => Ok(agent_dir(home, agent)?.join("settings.json")),
+        _ => Err("Unsupported MCP target".into()),
+    }
+}
+fn config(home: &Path, agent: &str) -> Result<(PathBuf, Option<Vec<u8>>, Value)> {
+    let path = config_path(home, agent)?;
+    let bytes = read(&path)?;
+    let value = match &bytes {
+        None => json!({}),
+        Some(bytes) if agent == "codex" => {
+            let text = std::str::from_utf8(bytes).map_err(|_| "Invalid TOML encoding")?;
+            let value: toml::Value =
+                toml::from_str(text).map_err(|_| "Invalid TOML; nothing was changed")?;
+            serde_json::to_value(value).map_err(|_| "Cannot read TOML")?
+        }
+        Some(bytes) => {
+            serde_json::from_slice(bytes).map_err(|_| "Invalid JSON; nothing was changed")?
+        }
+    };
+    if !value.is_object() {
+        return Err("Configuration root must be an object".into());
+    }
+    let key = if agent == "codex" {
+        "mcp_servers"
+    } else {
+        "mcpServers"
+    };
+    if value.get(key).is_some_and(|servers| !servers.is_object()) {
+        return Err("MCP servers must be an object; nothing was changed".into());
+    }
+    if value
+        .get(key)
+        .and_then(Value::as_object)
+        .is_some_and(|servers| servers.values().any(|server| !server.is_object()))
+    {
+        return Err("MCP server entries must be objects; nothing was changed".into());
+    }
+    Ok((path, bytes, value))
+}
+fn normalize(agent: &str, mut spec: Value) -> Result<Value> {
+    let object = spec.as_object_mut().ok_or("MCP server must be an object")?;
+    if agent == "gemini" {
+        if let Some(url) = object.remove("httpUrl") {
+            object.insert("url".into(), url);
+            object.insert("type".into(), json!("http"));
+        } else if object.contains_key("url") {
+            object.insert("type".into(), json!("sse"));
+        }
+    }
+    if agent == "codex" {
+        if let Some(headers) = object.remove("http_headers") {
+            object.insert("headers".into(), headers);
+        }
+        object.remove("enabled");
+    }
+    if !object.contains_key("type") {
+        object.insert(
+            "type".into(),
+            json!(if object.contains_key("url") {
+                "http"
+            } else {
+                "stdio"
+            }),
+        );
+    }
+    Ok(spec)
+}
+fn validate(agent: &str, spec: &Value) -> Result<()> {
+    agent_dir(Path::new("/"), agent)?;
+    let object = spec.as_object().ok_or("MCP server must be an object")?;
+    let transport = object
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or("Choose a transport")?;
+    match transport {
+        "stdio" => {
+            if object
+                .get("command")
+                .and_then(Value::as_str)
+                .is_none_or(|command| command.trim().is_empty())
+            {
+                return Err("stdio requires a command".into());
+            }
+            if object.contains_key("url") || object.contains_key("httpUrl") {
+                return Err("stdio cannot include a URL".into());
+            }
+        }
+        "http" | "sse" => {
+            if agent == "codex" && transport == "sse" {
+                return Err("Codex supports stdio and HTTP, not SSE".into());
+            }
+            let url = object
+                .get("url")
+                .and_then(Value::as_str)
+                .ok_or("HTTP/SSE requires a URL")?;
+            let parsed = reqwest::Url::parse(url).map_err(|_| "Invalid MCP URL")?;
+            if !matches!(parsed.scheme(), "http" | "https")
+                || parsed.host_str().is_none()
+                || !parsed.username().is_empty()
+                || parsed.password().is_some()
+            {
+                return Err("Use an HTTP(S) URL without embedded credentials".into());
+            }
+            if object.contains_key("command") || object.contains_key("args") {
+                return Err("HTTP/SSE cannot include command or args".into());
+            }
+        }
+        _ => return Err("Unsupported MCP transport".into()),
+    }
+    if let Some(args) = object.get("args") {
+        if !args
+            .as_array()
+            .is_some_and(|args| args.iter().all(Value::is_string))
+        {
+            return Err("args must be an array of strings".into());
+        }
+    }
+    for field in ["env", "headers"] {
+        if let Some(values) = object.get(field) {
+            if !values
+                .as_object()
+                .is_some_and(|values| values.values().all(Value::is_string))
+            {
+                return Err(format!("{field} must contain string values"));
+            }
+        }
+    }
+    if object.contains_key("httpUrl")
+        || object.contains_key("http_headers")
+        || object.contains_key("enabled")
+    {
+        return Err("Use normalized type/url/headers fields and the target enable switch".into());
+    }
+    Ok(())
+}
+fn encode(agent: &str, mut spec: Value) -> Value {
+    let object = spec.as_object_mut().unwrap();
+    let transport = object
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
+    if agent == "gemini" {
+        object.remove("type");
+        if transport == "http" {
+            if let Some(url) = object.remove("url") {
+                object.insert("httpUrl".into(), url);
+            }
+        }
+    }
+    if agent == "codex" {
+        object.remove("type");
+        if let Some(headers) = object.remove("headers") {
+            object.insert("http_headers".into(), headers);
+        }
+    }
+    spec
+}
+fn serialize_config(
+    agent: &str,
+    original: Option<&[u8]>,
+    value: &Value,
+    id: &str,
+) -> Result<Vec<u8>> {
+    if agent != "codex" {
+        return serde_json::to_vec_pretty(value).map_err(|_| "Cannot serialize MCP JSON".into());
+    }
+    let text =
+        std::str::from_utf8(original.unwrap_or_default()).map_err(|_| "Invalid TOML encoding")?;
+    let mut document = text
+        .parse::<toml_edit::Document>()
+        .map_err(|_| "Invalid TOML")?;
+    if document.get("mcp_servers").is_none() {
+        document["mcp_servers"] = toml_edit::table();
+    }
+    let servers = document["mcp_servers"]
+        .as_table_like_mut()
+        .ok_or("MCP servers must be a table")?;
+    if let Some(spec) = value["mcp_servers"].get(id) {
+        let table: toml::Value = serde_json::from_value(spec.clone())
+            .map_err(|_| "Server contains values unsupported in TOML")?;
+        let encoded = toml::to_string(&table).map_err(|_| "Cannot serialize MCP TOML")?;
+        let entry = encoded
+            .parse::<toml_edit::Document>()
+            .map_err(|_| "Cannot encode server")?;
+        servers.insert(id, toml_edit::Item::Table(entry.as_table().clone()));
+    } else {
+        servers.remove(id);
+    }
+    Ok(document.to_string().into_bytes())
+}
+fn mcp_change(
+    home: &Path,
+    id: &str,
+    entries: &[McpEntry],
+    remove: bool,
+    expected: &[McpEntry],
+) -> Result<()> {
+    valid_id(id)?;
+    let current = snapshot(home)?;
+    let actual: Vec<_> = current
+        .mcp
+        .into_iter()
+        .filter(|entry| entry.id == id)
+        .collect();
+    if serde_json::to_value(&actual).ok() != serde_json::to_value(expected).ok() {
+        return Err("Server changed since it was opened; refresh before saving".into());
+    }
+    let mut state = registry(home)?;
+    let mut writes = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for entry in entries {
+        if entry.id != id || !seen.insert(&entry.agent) {
+            return Err("Invalid or duplicate MCP target".into());
+        }
+        validate(&entry.agent, &entry.spec)?;
+    }
+    for agent in AGENTS {
+        let selected = if remove {
+            None
+        } else {
+            entries.iter().find(|entry| entry.agent == agent)
+        };
+        let (path, original, mut value) =
+            config(home, agent).map_err(|error| format!("{agent}: {error}"))?;
+        let key = if agent == "codex" {
+            "mcp_servers"
+        } else {
+            "mcpServers"
+        };
+        let had_live = value.get(key).and_then(|map| map.get(id)).is_some();
+        state.disabled.entry(agent.into()).or_default().remove(id);
+        if selected.is_none() && !had_live {
+            continue;
+        }
+        if value.get(key).is_none() {
+            value[key] = json!({});
+        }
+        let servers = value[key].as_object_mut().unwrap();
+        if let Some(entry) = selected {
+            if entry.enabled {
+                servers.insert(id.into(), encode(agent, entry.spec.clone()));
+            } else {
+                servers.remove(id);
+                state
+                    .disabled
+                    .entry(agent.into())
+                    .or_default()
+                    .insert(id.into(), entry.spec.clone());
+            }
+        } else {
+            servers.remove(id);
+        }
+        let bytes = serialize_config(agent, original.as_deref(), &value, id)?;
+        writes.push((path, original, bytes));
+    }
+    let registry_path = store(home).join("state.json");
+    writes.push((
+        registry_path.clone(),
+        read(&registry_path)?,
+        serde_json::to_vec_pretty(&state).map_err(|_| "Cannot serialize registry")?,
+    ));
+    for (path, original, _) in &writes {
+        if read(path)? != *original {
+            return Err("Configuration changed while saving; retry".into());
+        }
+        if let Some(bytes) = original {
+            atomic(&path.with_extension("ecpa-backup"), bytes)?;
+        }
+    }
+    let mut completed: Vec<(PathBuf, Option<Vec<u8>>, Vec<u8>)> = Vec::new();
+    for (path, original, bytes) in writes {
+        let outcome = (|| {
+            if read(&path)? != original {
+                return Err("Configuration changed while saving; backups retained".into());
+            }
+            atomic(&path, &bytes)
+        })();
+        if let Err(error) = outcome {
+            let mut rollback_failed = false;
+            for (path, previous, written) in completed.into_iter().rev() {
+                if read(&path).ok().flatten().as_deref() != Some(written.as_slice()) {
+                    rollback_failed = true;
+                    continue;
+                }
+                let outcome = match previous {
+                    Some(bytes) => atomic(&path, &bytes),
+                    None => fs::remove_file(path)
+                        .map_err(|_| "Cannot roll back new configuration".into()),
+                };
+                rollback_failed |= outcome.is_err();
+            }
+            return Err(if rollback_failed {
+                "Save failed and rollback was incomplete; restore .ecpa-backup files".into()
+            } else {
+                error
+            });
+        }
+        completed.push((path, original, bytes));
+    }
+    Ok(())
+}
+fn snapshot(home: &Path) -> Result<Snapshot> {
+    let state = registry(home)?;
+    let mut errors = Vec::new();
+    let skills = skills(home, &state, &mut errors);
+    let mut mcp = Vec::new();
+    for agent in AGENTS {
+        match config(home, agent) {
+            Ok((_, _, value)) => {
+                let key = if agent == "codex" {
+                    "mcp_servers"
+                } else {
+                    "mcpServers"
+                };
+                if let Some(servers) = value.get(key).and_then(Value::as_object) {
+                    for (id, raw) in servers {
+                        match normalize(agent, raw.clone()) {
+                            Ok(spec) => mcp.push(McpEntry {
+                                id: id.clone(),
+                                agent: agent.into(),
+                                enabled: raw
+                                    .get("enabled")
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(true),
+                                spec,
+                            }),
+                            Err(error) => errors.push(format!("{agent}: {error}")),
+                        }
+                    }
+                }
+                if let Some(disabled) = state.disabled.get(agent) {
+                    for (id, spec) in disabled {
+                        if !mcp
+                            .iter()
+                            .any(|entry| entry.agent == agent && entry.id == *id)
+                        {
+                            mcp.push(McpEntry {
+                                id: id.clone(),
+                                agent: agent.into(),
+                                enabled: false,
+                                spec: spec.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+            Err(error) => errors.push(format!("{agent}: {error}")),
+        }
+    }
+    Ok(Snapshot {
+        skills,
+        mcp,
+        errors,
+    })
+}
+fn home(app: &tauri::AppHandle) -> Result<PathBuf> {
+    app.path()
+        .home_dir()
+        .map_err(|_| "Cannot resolve home directory".into())
+}
+#[tauri::command]
+pub fn get_agent_resources(app: tauri::AppHandle) -> Result<Snapshot> {
+    let _guard = LOCK.lock().map_err(|_| "Resource operation unavailable")?;
+    snapshot(&home(&app)?)
+}
+#[tauri::command]
+pub fn update_agent_skill(
+    app: tauri::AppHandle,
+    name: String,
+    source: Option<String>,
+    targets: Vec<String>,
+    remove: bool,
+) -> Result<()> {
+    let _guard = LOCK.lock().map_err(|_| "Resource operation unavailable")?;
+    skill_change(&home(&app)?, &name, source.as_deref(), &targets, remove)
+}
+#[tauri::command]
+pub fn update_agent_mcp(
+    app: tauri::AppHandle,
+    id: String,
+    entries: Vec<McpEntry>,
+    remove: bool,
+    expected: Vec<McpEntry>,
+) -> Result<()> {
+    let _guard = LOCK.lock().map_err(|_| "Resource operation unavailable")?;
+    mcp_change(&home(&app)?, &id, &entries, remove, &expected)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "ecpa-resources-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+        fn write(&self, relative: &str, text: &str) -> PathBuf {
+            let path = self.0.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, text).unwrap();
+            path
+        }
+        fn skill(&self) -> PathBuf {
+            self.write(
+                "source/SKILL.md",
+                "---\nname: fixture\ndescription: Local fixture description\n---\nInstructions",
+            );
+            self.write("source/scripts/check.sh", "echo fixture");
+            self.0.join("source")
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    fn targets() -> Vec<String> {
+        AGENTS.iter().map(|agent| agent.to_string()).collect()
+    }
+    fn entries(id: &str) -> Vec<McpEntry> {
+        AGENTS.iter().map(|agent| McpEntry { id: id.into(), agent: agent.to_string(), enabled: true, spec: json!({"type":"stdio", "command":"never-executed-fixture", "args":["--local"], "env":{"TOKEN":"fixture"}, "unknown":{"keep":true}}) }).collect()
+    }
+    fn expected(fixture: &Fixture, id: &str) -> Vec<McpEntry> {
+        snapshot(&fixture.0)
+            .unwrap()
+            .mcp
+            .into_iter()
+            .filter(|entry| entry.id == id)
+            .collect()
+    }
+
+    #[test]
+    fn discovery_import_sync_uninstall_never_delete_source() {
+        let fixture = Fixture::new();
+        let source = fixture.skill();
+        fixture.write(
+            ".claude/skills/existing/SKILL.md",
+            "---\ndescription: Existing skill\n---\nText",
+        );
+        let found = snapshot(&fixture.0).unwrap();
+        assert_eq!(found.skills[0].name, "existing");
+        assert_eq!(found.skills[0].description, "Existing skill");
+        assert!(!found.skills[0].managed);
+        skill_change(&fixture.0, "fixture", source.to_str(), &targets(), false).unwrap();
+        let found = snapshot(&fixture.0).unwrap();
+        let imported = found
+            .skills
+            .iter()
+            .find(|skill| skill.name == "fixture")
+            .unwrap();
+        assert_eq!(imported.description, "Local fixture description");
+        assert_eq!(imported.installed.len(), 3);
+        skill_change(&fixture.0, "fixture", None, &["codex".into()], false).unwrap();
+        assert!(!fixture.0.join(".claude/skills/fixture").exists());
+        assert!(fixture.0.join(".codex/skills/fixture/SKILL.md").exists());
+        skill_change(&fixture.0, "fixture", None, &[], true).unwrap();
+        assert!(source.join("SKILL.md").exists());
+        assert!(!store(&fixture.0).join("skills/fixture").exists());
+        assert!(fixture.0.join(".claude/skills/existing/SKILL.md").exists());
+    }
+    #[test]
+    fn unmanaged_and_modified_source_copies_cannot_be_removed() {
+        let fixture = Fixture::new();
+        let original = fixture.skill();
+        let unmanaged = fixture.write(".claude/skills/unmanaged/SKILL.md", "Keep original");
+        assert!(skill_change(&fixture.0, "unmanaged", None, &[], true).is_err());
+        assert_eq!(fs::read_to_string(unmanaged).unwrap(), "Keep original");
+        skill_change(&fixture.0, "fixture", original.to_str(), &targets(), false).unwrap();
+        let cached = store(&fixture.0).join("skills/fixture/SKILL.md");
+        fs::write(&cached, "Edited private source").unwrap();
+        assert!(skill_change(&fixture.0, "fixture", None, &[], true).is_err());
+        assert_eq!(fs::read_to_string(cached).unwrap(), "Edited private source");
+        assert!(original.join("SKILL.md").exists());
+        for agent in AGENTS {
+            assert!(agent_dir(&fixture.0, agent)
+                .unwrap()
+                .join("skills/fixture/SKILL.md")
+                .exists());
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn mcp_symlink_config_is_rejected_without_writing_other_targets() {
+        use std::os::unix::fs::symlink;
+        let fixture = Fixture::new();
+        let outside = Fixture::new();
+        let config = outside.write("settings.json", r#"{"keep":"fixture"}"#);
+        fs::create_dir(fixture.0.join(".gemini")).unwrap();
+        symlink(&config, fixture.0.join(".gemini/settings.json")).unwrap();
+        assert!(mcp_change(&fixture.0, "docs", &entries("docs"), false, &[]).is_err());
+        assert_eq!(fs::read_to_string(config).unwrap(), r#"{"keep":"fixture"}"#);
+        assert!(!fixture.0.join(".claude.json").exists());
+        assert!(!fixture.0.join(".codex/config.toml").exists());
+        assert!(!store(&fixture.0).exists());
+    }
+    #[test]
+    fn skill_conflicts_and_modified_targets_are_not_overwritten() {
+        let fixture = Fixture::new();
+        let source = fixture.skill();
+        let occupied = fixture.write(".gemini/skills/fixture/SKILL.md", "Do not overwrite");
+        assert!(skill_change(&fixture.0, "fixture", source.to_str(), &targets(), false).is_err());
+        assert!(!fixture.0.join(".claude/skills/fixture").exists());
+        assert!(!store(&fixture.0).exists());
+        assert_eq!(fs::read_to_string(occupied).unwrap(), "Do not overwrite");
+        skill_change(
+            &fixture.0,
+            "fixture",
+            source.to_str(),
+            &["codex".into()],
+            false,
+        )
+        .unwrap();
+        let modified = fixture.write(".codex/skills/fixture/SKILL.md", "User modification");
+        assert!(skill_change(&fixture.0, "fixture", None, &[], true).is_err());
+        assert_eq!(fs::read_to_string(modified).unwrap(), "User modification");
+    }
+    #[test]
+    fn skill_traversal_invalid_source_and_unsupported_targets() {
+        let fixture = Fixture::new();
+        let source = fixture.skill();
+        for name in ["../escape", "/absolute", "..", "", "a/b"] {
+            assert!(skill_change(&fixture.0, name, source.to_str(), &targets(), false).is_err());
+        }
+        assert!(skill_change(
+            &fixture.0,
+            "fixture",
+            source.to_str(),
+            &["unsupported".into()],
+            false
+        )
+        .is_err());
+        assert!(skill_change(&fixture.0, "fixture", Some("relative"), &[], false).is_err());
+        assert!(skill_change(
+            &fixture.0,
+            "fixture",
+            Some(fixture.0.to_str().unwrap()),
+            &[],
+            false
+        )
+        .is_err());
+        assert!(skill_change(&fixture.0, "fixture", source.to_str(), &[], true).is_err());
+        assert!(!store(&fixture.0).exists());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_rejected_and_script_execute_bit_preserved() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let fixture = Fixture::new();
+        let source = fixture.skill();
+        fs::set_permissions(
+            source.join("scripts/check.sh"),
+            fs::Permissions::from_mode(0o750),
+        )
+        .unwrap();
+        symlink(source.join("SKILL.md"), source.join("linked")).unwrap();
+        assert!(skill_change(&fixture.0, "fixture", source.to_str(), &targets(), false).is_err());
+        fs::remove_file(source.join("linked")).unwrap();
+        skill_change(&fixture.0, "fixture", source.to_str(), &targets(), false).unwrap();
+        assert_eq!(
+            fs::metadata(fixture.0.join(".codex/skills/fixture/scripts/check.sh"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o750
+        );
+        let outside = Fixture::new();
+        symlink(&outside.0, fixture.0.join(".redirect")).unwrap();
+        assert!(atomic(&fixture.0.join(".redirect/config"), b"secret").is_err());
+        assert!(!outside.0.join("config").exists());
+    }
+    #[test]
+    fn mcp_roundtrip_preserves_unrelated_settings_and_comments() {
+        let fixture = Fixture::new();
+        let claude = fixture.write(".claude.json", r#"{"theme":"dark","projects":{"local":{"trust":true}},"mcpServers":{"other":{"command":"other"}}}"#);
+        let codex = fixture.write(".codex/config.toml", "# keep this comment\nmodel = 'fixture'\n[mcp_servers.other]\ncommand = 'other'\n[unknown]\nretain = 42\n");
+        let gemini = fixture.write(
+            ".gemini/settings.json",
+            r#"{"security":{"trust":true},"mcpServers":{"other":{"command":"other"}}}"#,
+        );
+        let original = fs::read(&claude).unwrap();
+        mcp_change(&fixture.0, "docs", &entries("docs"), false, &[]).unwrap();
+        assert_eq!(expected(&fixture, "docs").len(), 3);
+        let claude_value: Value = serde_json::from_slice(&fs::read(&claude).unwrap()).unwrap();
+        assert_eq!(claude_value["projects"]["local"]["trust"], true);
+        assert_eq!(claude_value["mcpServers"]["other"]["command"], "other");
+        assert_eq!(
+            fs::read(claude.with_extension("ecpa-backup")).unwrap(),
+            original
+        );
+        let codex_text = fs::read_to_string(&codex).unwrap();
+        assert!(codex_text.contains("# keep this comment"));
+        assert!(codex_text.contains("retain = 42"));
+        let gemini_value: Value = serde_json::from_slice(&fs::read(gemini).unwrap()).unwrap();
+        assert_eq!(gemini_value["security"]["trust"], true);
+        let previous = expected(&fixture, "docs");
+        mcp_change(&fixture.0, "docs", &[], true, &previous).unwrap();
+        assert!(expected(&fixture, "docs").is_empty());
+        assert_eq!(expected(&fixture, "other").len(), 3);
+    }
+    #[test]
+    fn per_target_disable_survives_reload_and_enable_restores_secrets() {
+        let fixture = Fixture::new();
+        mcp_change(&fixture.0, "docs", &entries("docs"), false, &[]).unwrap();
+        let previous = expected(&fixture, "docs");
+        let mut changed = previous.clone();
+        for entry in &mut changed {
+            entry.enabled = false;
+        }
+        mcp_change(&fixture.0, "docs", &changed, false, &previous).unwrap();
+        let disabled = expected(&fixture, "docs");
+        assert_eq!(disabled.len(), 3);
+        assert!(disabled.iter().all(|entry| !entry.enabled));
+        for agent in AGENTS {
+            let (_, _, value) = config(&fixture.0, agent).unwrap();
+            assert!(value[if agent == "codex" {
+                "mcp_servers"
+            } else {
+                "mcpServers"
+            }]
+            .get("docs")
+            .is_none());
+        }
+        let mut enabled = disabled.clone();
+        enabled[0].enabled = true;
+        mcp_change(&fixture.0, "docs", &enabled, false, &disabled).unwrap();
+        let reloaded = expected(&fixture, "docs");
+        assert_eq!(reloaded.iter().filter(|entry| entry.enabled).count(), 1);
+        assert_eq!(reloaded[0].spec["env"]["TOKEN"], "fixture");
+        mcp_change(&fixture.0, "docs", &[], true, &reloaded).unwrap();
+        assert!(expected(&fixture, "docs").is_empty());
+    }
+    #[test]
+    fn http_headers_gemini_field_mapping_and_sse_capabilities() {
+        let fixture = Fixture::new();
+        let mut remote = entries("remote");
+        for entry in &mut remote {
+            entry.spec = json!({"type":"http","url":"http://localhost:1234/mcp","headers":{"Authorization":"fixture"}});
+        }
+        mcp_change(&fixture.0, "remote", &remote, false, &[]).unwrap();
+        let (_, _, gemini) = config(&fixture.0, "gemini").unwrap();
+        assert_eq!(
+            gemini["mcpServers"]["remote"]["httpUrl"],
+            "http://localhost:1234/mcp"
+        );
+        let (_, _, codex) = config(&fixture.0, "codex").unwrap();
+        assert_eq!(
+            codex["mcp_servers"]["remote"]["http_headers"]["Authorization"],
+            "fixture"
+        );
+        let sse = json!({"type":"sse","url":"https://example.invalid/events"});
+        assert!(validate("codex", &sse).is_err());
+        assert!(validate("gemini", &sse).is_ok());
+        assert!(validate("claude", &sse).is_ok());
+        assert!(validate(
+            "claude",
+            &json!({"type":"http","url":"https://user:secret@example.invalid"})
+        )
+        .is_err());
+    }
+    #[test]
+    fn malformed_configs_never_write_any_target() {
+        for (path, text) in [
+            (".gemini/settings.json", "{"),
+            (".codex/config.toml", "model = ["),
+            (".claude.json", "[]"),
+            (".claude.json", r#"{"mcpServers":[]}"#),
+            (".claude.json", r#"{"mcpServers":{"broken":false}}"#),
+        ] {
+            let fixture = Fixture::new();
+            let bad = fixture.write(path, text);
+            let before = fs::read(&bad).unwrap();
+            assert!(!snapshot(&fixture.0).unwrap().errors.is_empty());
+            assert!(mcp_change(&fixture.0, "docs", &entries("docs"), false, &[]).is_err());
+            assert_eq!(fs::read(bad).unwrap(), before);
+            assert!(!store(&fixture.0).join("state.json").exists());
+        }
+    }
+    #[test]
+    fn stale_editor_conflicts_invalid_json_and_unsupported_transport_do_not_write() {
+        let fixture = Fixture::new();
+        mcp_change(&fixture.0, "docs", &entries("docs"), false, &[]).unwrap();
+        let stale = expected(&fixture, "docs");
+        fixture.write(
+            ".claude.json",
+            r#"{"mcpServers":{"docs":{"type":"stdio","command":"changed"}}}"#,
+        );
+        assert!(mcp_change(&fixture.0, "docs", &entries("docs"), false, &stale).is_err());
+        let before = fs::read(fixture.0.join(".claude.json")).unwrap();
+        let mut invalid = entries("new");
+        invalid[1].spec = json!({"type":"sse","url":"http://localhost/events"});
+        assert!(mcp_change(&fixture.0, "new", &invalid, false, &[]).is_err());
+        invalid[1].spec = json!({"type":"stdio","command":"fixture","env":{"TOKEN":false}});
+        assert!(mcp_change(&fixture.0, "new", &invalid, false, &[]).is_err());
+        assert_eq!(fs::read(fixture.0.join(".claude.json")).unwrap(), before);
+    }
+    #[test]
+    fn write_failure_rolls_back_previously_written_targets() {
+        let fixture = Fixture::new();
+        let claude = fixture.write(".claude.json", "{\"unknown\":true}");
+        fixture.write(".gemini/settings.ecpa-tmp", "occupied temporary file");
+        assert!(mcp_change(&fixture.0, "docs", &entries("docs"), false, &[]).is_err());
+        assert_eq!(fs::read_to_string(claude).unwrap(), "{\"unknown\":true}");
+        assert!(!fixture.0.join(".codex/config.toml").exists());
+        assert!(!store(&fixture.0).join("state.json").exists());
+    }
+}

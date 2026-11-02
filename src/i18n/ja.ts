@@ -1,4 +1,5 @@
 import { routingJa } from './locales/routing';
+import { agentResourcesJa } from './agentResources';
 import type { MessageKey } from './locales/zh-CN';
 import { easyModeJa } from './easyMode';
 import { homeJa } from './home';
@@ -6,6 +7,7 @@ import { authFileListJa } from './authFileList';
 import { themeDiyJa } from './themeDiy';
 
 export const jaOverrides = {
+  ...agentResourcesJa,
   ...routingJa,
   ...themeDiyJa,
   'app.window.minimize': '最小化',

@@ -1,4 +1,5 @@
 import { routingEn } from './routing';
+import { agentResourcesEn } from '../agentResources';
 import type { MessageKey } from './zh-CN';
 import { easyModeEn } from '../easyMode';
 import { homeEn } from '../home';
@@ -6,6 +7,7 @@ import { authFileListEn } from '../authFileList';
 import { themeDiyEn } from '../themeDiy';
 
 export const en: Record<MessageKey, string> = {
+  ...agentResourcesEn,
   ...routingEn,
   ...themeDiyEn,
   'app.window.minimize': 'Minimize',
@@ -447,7 +449,7 @@ export const en: Record<MessageKey, string> = {
   'app.theme.midnight.description': 'Ink-blue to indigo gradient, translucent panels and soft periwinkle accents',
   'app.theme.sakura.name': 'Sakura Blush',
   'app.theme.sakura.description': 'Pale cherry-blossom pink fading into cream, with translucent panels and charcoal text',
-  'app.theme.anime.name': '渐离の梦境',
+  'app.theme.anime.name': 'Jianli’s Dreamscape',
   'app.theme.anime.description': 'Starlight lavender-rose gradient with frosted glass panels and custom anime wallpaper support',
   'app.theme.anime.backdropTitle': 'Anime theme wallpaper',
   'app.theme.anime.preset.starlight': 'Starlight Dusk',

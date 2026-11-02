@@ -1,0 +1,125 @@
+const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
+const assert = require('node:assert/strict');
+const path = require('node:path');
+const { mkdtempSync, rmSync } = require('node:fs');
+const { tmpdir } = require('node:os');
+
+(async () => {
+  const { createServer } = await import('vite');
+  const react = (await import('@vitejs/plugin-react')).default;
+  const cacheDir = mkdtempSync(path.join(tmpdir(), 'ecpa-resource-ui-'));
+  let server;
+  let browser;
+  let closing;
+  const closeServer = () => closing ??= (async () => {
+    await server?.close();
+    rmSync(cacheDir, { recursive: true, force: true });
+  })();
+  const deadline = setTimeout(async () => {
+    console.error('Resource UI test exceeded 180 seconds');
+    try { await browser?.close(); } finally {
+      await closeServer();
+      process.exitCode = 1;
+    }
+  }, 180000);
+  try {
+    server = await createServer({ configFile: false, root: path.resolve(__dirname, '..'), cacheDir, plugins: [react()], logLevel: 'error', server: { host: '127.0.0.1', port: 0, watch: null } });
+    await server.listen();
+    const base = `http://127.0.0.1:${server.httpServer.address().port}`;
+    browser = await chromium.launch({ headless: true, args: ['--no-proxy-server'] });
+    const page = await browser.newPage({ viewport: { width: 1360, height: 1000 } });
+    page.setDefaultTimeout(20000);
+    page.setDefaultNavigationTimeout(60000);
+    const errors = [];
+    page.on('pageerror', error => errors.push(String(error)));
+    await page.route('**/*', route => route.request().url().startsWith(base) ? route.continue() : route.abort());
+    await page.addInitScript(() => localStorage.setItem('easy-cli-proxy-api.locale', 'en'));
+    const enter = async scenario => {
+      await page.goto(`${base}/?mock=${scenario}&mockDelay=5`);
+      await page.locator('.app-shell').waitFor();
+      await page.locator('.nav-section').getByRole('button', { name: 'Agent Configuration', exact: true }).click();
+      await page.getByRole('tab', { name: 'Skills', exact: true }).click();
+      await page.locator('.resource-toolbar').getByRole('button', { name: 'Import local Skill', exact: true }).waitFor();
+    };
+    await enter('running');
+    await page.getByRole('heading', { name: 'review-checklist' }).waitFor();
+    await page.getByRole('combobox', { name: 'Target client', exact: true }).selectOption('codex');
+    await page.getByText('No matching resources.', { exact: true }).waitFor();
+    await page.getByRole('combobox', { name: 'Target client', exact: true }).selectOption('');
+    await page.getByRole('textbox', { name: 'Search name, description or path' }).fill('no-match');
+    await page.getByText('No matching resources.', { exact: true }).waitFor();
+    await page.getByRole('textbox', { name: 'Search name, description or path' }).fill('');
+    await page.locator('.resource-toolbar').getByRole('button', { name: 'Import local Skill', exact: true }).click();
+    let dialog = page.getByRole('dialog');
+    await dialog.getByLabel('Identifier', { exact: true }).fill('fixture-checks');
+    await dialog.getByLabel('Source directory (absolute path)', { exact: true }).fill('/fixtures/skills/fixture-checks');
+    await dialog.getByLabel('Codex', { exact: true }).check();
+    await dialog.getByRole('button', { name: 'Save changes', exact: true }).click();
+    await page.getByRole('heading', { name: 'fixture-checks', exact: true }).waitFor();
+    await page.screenshot({ path: '/tmp/ecpa_issue-490-skills-mcp-1102_ui_skills.png', fullPage: true });
+    const skillCard = page.locator('.resource-card').filter({ has: page.getByRole('heading', { name: 'fixture-checks', exact: true }) });
+    await skillCard.getByRole('button', { name: 'Manage', exact: true }).click();
+    dialog = page.getByRole('dialog');
+    await dialog.getByLabel('Gemini CLI', { exact: true }).check();
+    await dialog.getByRole('button', { name: 'Save changes', exact: true }).click();
+    await dialog.waitFor({ state: 'detached' });
+    assert.match(await skillCard.locator('.resource-statuses').innerText(), /Gemini CLI · Installed \/ enabled/);
+    await skillCard.getByRole('button', { name: 'Remove', exact: true }).click();
+    await page.getByRole('alertdialog').getByRole('button', { name: 'Cancel', exact: true }).click();
+    assert.equal(await skillCard.count(), 1);
+    await skillCard.getByRole('button', { name: 'Remove', exact: true }).click();
+    await page.getByRole('alertdialog').getByRole('button', { name: 'Confirm', exact: true }).click();
+    await skillCard.waitFor({ state: 'detached' });
+    await page.getByRole('tab', { name: 'MCP', exact: true }).click();
+    await page.getByRole('heading', { name: 'local-docs', exact: true }).waitFor();
+    await page.screenshot({ path: '/tmp/ecpa_issue-490-skills-mcp-1102_ui_mcp.png', fullPage: true });
+    await page.getByRole('button', { name: 'Manage', exact: true }).click();
+    dialog = page.getByRole('dialog');
+    const json = dialog.getByRole('textbox', { name: 'Claude Code Server JSON', exact: true });
+    assert(!(await json.inputValue()).includes('non-sensitive-fixture'));
+    await page.screenshot({ path: '/tmp/ecpa_issue-490-skills-mcp-1102_ui_mcp_editor.png', fullPage: true });
+    await json.fill('{');
+    await dialog.getByRole('button', { name: 'Save changes', exact: true }).click();
+    await dialog.getByRole('alert').waitFor();
+    await json.fill(JSON.stringify({ type: 'stdio', command: 'docs-server', args: ['--fixture'], env: { DEMO_TOKEN: '••••••••' }, custom: true }, null, 2));
+    await dialog.getByLabel('Gemini CLI', { exact: true }).check();
+    await page.setViewportSize({ width: 480, height: 860 });
+    const editorBounds = await dialog.boundingBox();
+    assert(editorBounds && editorBounds.x >= 0 && editorBounds.y >= 0 && editorBounds.x + editorBounds.width <= 480 && editorBounds.y + editorBounds.height <= 860);
+    await dialog.getByRole('button', { name: 'Save changes', exact: true }).click();
+    await dialog.waitFor({ state: 'detached' });
+    await page.setViewportSize({ width: 1360, height: 1000 });
+    assert((await page.locator('.resource-statuses').innerText()).includes('Gemini CLI · stdio · Enabled'));
+    await page.getByRole('button', { name: 'Manage', exact: true }).click();
+    dialog = page.getByRole('dialog');
+    await dialog.getByRole('checkbox', { name: 'Enabled', exact: true }).first().uncheck();
+    await dialog.getByRole('button', { name: 'Save changes', exact: true }).click();
+    await page.getByRole('alertdialog').getByRole('button', { name: 'Confirm', exact: true }).click();
+    await dialog.waitFor({ state: 'detached' });
+    await page.getByText('Claude Code · stdio · Disabled', { exact: true }).waitFor();
+    await page.getByRole('button', { name: 'Remove', exact: true }).click();
+    await page.getByRole('alertdialog').getByRole('button', { name: 'Confirm', exact: true }).click();
+    await page.getByText('No local resources found.', { exact: false }).waitFor();
+    await page.getByRole('button', { name: 'Add MCP server', exact: true }).click();
+    dialog = page.getByRole('dialog');
+    await dialog.getByLabel('Identifier', { exact: true }).fill('new-docs');
+    await dialog.getByLabel('Codex', { exact: true }).check();
+    await dialog.getByRole('textbox', { name: 'Codex Server JSON', exact: true }).fill('{"type":"http","url":"http://localhost:3000/mcp"}');
+    await dialog.getByRole('button', { name: 'Save changes', exact: true }).click();
+    await page.getByRole('heading', { name: 'new-docs', exact: true }).waitFor();
+    await page.setViewportSize({ width: 480, height: 860 });
+    assert(await page.locator('.resource-page').evaluate(element => element.scrollWidth <= element.clientWidth + 2));
+    await enter('empty');
+    await page.getByText('No local resources found.', { exact: false }).waitFor();
+    await enter('error');
+    await page.locator('.resource-page').getByRole('alert').waitFor();
+    assert.match(await page.locator('.resource-page').innerText(), /Resource fixture read\/write failed/);
+    assert.deepEqual(errors, []);
+    console.log('PASS: navigation, Skills import/search/filter/remove, MCP masked editor/add/save/disable/delete, validation, responsive, error and empty flows');
+  } finally {
+    try { await browser?.close(); } finally {
+      await closeServer();
+      clearTimeout(deadline);
+    }
+  }
+})().catch(error => { console.error(error); process.exitCode = 1; });

@@ -4,6 +4,7 @@ import { requestBucketRangeLabel } from '../services/authFileRequests';
 import { createPluginMock, type PluginWebviewMockState } from './pluginMock';
 import { createQuotaMock, createQuotaMockFiles } from './quotaMock';
 import { normalizeAuthFileTags } from '../services/authFiles';
+import { createAgentResourcesMock } from './agentResourcesMock';
 
 export type BrowserMockScenario = 'running' | 'stopped' | 'empty' | 'error';
 export type BrowserMockMode = BrowserMockScenario | 'off';
@@ -986,6 +987,7 @@ export function createBrowserMockRuntime(
   onPluginWebview?: (state: PluginWebviewMockState) => void,
 ): BrowserMockRuntime {
   const state = createState(scenario);
+  const resourceMock = createAgentResourcesMock(scenario);
   let usageViewPreferences: Record<string, string> = {};
   let privacyMode: boolean | null = null;
   let themeSelection: ThemeSelection | null = null;
@@ -1006,6 +1008,8 @@ export function createBrowserMockRuntime(
   const invoke = async (command: string, rawPayload?: unknown): Promise<unknown> => {
     await sleep(delayMs);
     const payload = asObject(rawPayload);
+    const resourceResponse = resourceMock(command, payload);
+    if (resourceResponse) return resourceResponse.value;
     if (scenario === 'error' && ERROR_SCENARIO_COMMANDS.has(command)) {
       throw new Error(`Browser Mock error scenario: ${command}`);
     }

@@ -1,10 +1,12 @@
 import { routingZhCN } from './routing';
+import { agentResourcesZhCN } from '../agentResources';
 import { easyModeZhCN } from '../easyMode';
 import { homeZhCN } from '../home';
 import { authFileListZhCN } from '../authFileList';
 import { themeDiyZhCN } from '../themeDiy';
 
 export const zhCN = {
+  ...agentResourcesZhCN,
   ...routingZhCN,
   ...themeDiyZhCN,
   'app.window.minimize': '最小化',
