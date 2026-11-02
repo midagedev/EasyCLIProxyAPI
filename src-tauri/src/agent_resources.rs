@@ -23,6 +23,8 @@ struct Registry {
 #[derive(Serialize, Deserialize)]
 struct ManagedSkill {
     source: String,
+    #[serde(default)]
+    source_fingerprint: Option<String>,
     targets: BTreeMap<String, String>,
 }
 #[derive(Serialize)]
@@ -410,8 +412,17 @@ fn skill_change(
         .get(name)
         .map(|skill| skill.targets.clone())
         .unwrap_or_default();
-    if previous.values().any(|expected| *expected != hash) {
-        return Err("Managed source changed externally; import it under a new identifier".into());
+    if let Some(managed) = state.skills.get(name) {
+        let expected = managed
+            .source_fingerprint
+            .as_ref()
+            .or_else(|| previous.values().next())
+            .ok_or("Managed source fingerprint is unknown; no files were changed; import it under a new identifier")?;
+        if *expected != hash || previous.values().any(|expected| *expected != hash) {
+            return Err(
+                "Managed source changed externally; import it under a new identifier".into(),
+            );
+        }
     }
     let mut additions = Vec::new();
     let mut removals = Vec::new();
@@ -475,6 +486,7 @@ fn skill_change(
             state.skills.insert(
                 name.into(),
                 ManagedSkill {
+                    source_fingerprint: Some(hash.clone()),
                     source: state
                         .skills
                         .get(name)
@@ -920,7 +932,7 @@ mod tests {
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
             fs::create_dir(&path).unwrap();
-            Self(path)
+            Self(fs::canonicalize(path).unwrap())
         }
         fn write(&self, relative: &str, text: &str) -> PathBuf {
             let path = self.0.join(relative);
@@ -1020,6 +1032,117 @@ mod tests {
         assert!(!fixture.0.join(".claude.json").exists());
         assert!(!fixture.0.join(".codex/config.toml").exists());
         assert!(!store(&fixture.0).exists());
+    }
+    fn assert_source_operations_rejected(fixture: &Fixture, message: &str) {
+        let cache = store(&fixture.0).join("skills/fixture");
+        let original_hash = fingerprint(&files(&fixture.0.join("source")).unwrap());
+        let cached_hash = fingerprint(&files(&cache).unwrap());
+        let registry_path = store(&fixture.0).join("state.json");
+        let before = fs::read(&registry_path).unwrap();
+        for (selected, remove) in [(Vec::new(), true), (targets(), false), (Vec::new(), false)] {
+            let error = skill_change(&fixture.0, "fixture", None, &selected, remove).unwrap_err();
+            assert!(error.contains(message), "{error}");
+            assert_eq!(fingerprint(&files(&cache).unwrap()), cached_hash);
+            assert_eq!(
+                fingerprint(&files(&fixture.0.join("source")).unwrap()),
+                original_hash
+            );
+            assert_eq!(fs::read(&registry_path).unwrap(), before);
+            assert!(!cache.with_extension("ecpa-remove").exists());
+            for agent in AGENTS {
+                assert!(!agent_dir(&fixture.0, agent)
+                    .unwrap()
+                    .join("skills/fixture")
+                    .exists());
+            }
+        }
+    }
+    #[test]
+    fn zero_target_import_rejects_modified_source_on_remove_and_reinstall() {
+        let fixture = Fixture::new();
+        let source = fixture.skill();
+        let original_hash = fingerprint(&files(&source).unwrap());
+        skill_change(&fixture.0, "fixture", source.to_str(), &[], false).unwrap();
+        assert_eq!(
+            registry(&fixture.0).unwrap().skills["fixture"].source_fingerprint,
+            Some(original_hash.clone())
+        );
+        fs::write(
+            store(&fixture.0).join("skills/fixture/SKILL.md"),
+            "Externally edited cached source",
+        )
+        .unwrap();
+        assert_source_operations_rejected(&fixture, "Managed source changed externally");
+        assert_eq!(fingerprint(&files(&source).unwrap()), original_hash);
+    }
+    #[test]
+    fn deselecting_all_targets_retains_source_modification_guard() {
+        let fixture = Fixture::new();
+        let source = fixture.skill();
+        let original_hash = fingerprint(&files(&source).unwrap());
+        skill_change(&fixture.0, "fixture", source.to_str(), &targets(), false).unwrap();
+        skill_change(&fixture.0, "fixture", None, &[], false).unwrap();
+        let state = registry(&fixture.0).unwrap();
+        assert!(state.skills["fixture"].targets.is_empty());
+        assert_eq!(
+            state.skills["fixture"].source_fingerprint,
+            Some(original_hash.clone())
+        );
+        fs::write(
+            store(&fixture.0).join("skills/fixture/scripts/check.sh"),
+            "Externally edited script",
+        )
+        .unwrap();
+        assert_source_operations_rejected(&fixture, "Managed source changed externally");
+        assert_eq!(fingerprint(&files(&source).unwrap()), original_hash);
+    }
+    fn remove_source_fingerprint(fixture: &Fixture) {
+        let path = store(&fixture.0).join("state.json");
+        let mut state: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        state["skills"]["fixture"]
+            .as_object_mut()
+            .unwrap()
+            .remove("source_fingerprint");
+        fs::write(path, serde_json::to_vec(&state).unwrap()).unwrap();
+    }
+    #[test]
+    fn legacy_target_fingerprint_migrates_before_deselecting_all_targets() {
+        let fixture = Fixture::new();
+        let source = fixture.skill();
+        let original_hash = fingerprint(&files(&source).unwrap());
+        skill_change(&fixture.0, "fixture", source.to_str(), &targets(), false).unwrap();
+        remove_source_fingerprint(&fixture);
+        skill_change(&fixture.0, "fixture", None, &[], false).unwrap();
+        assert_eq!(
+            registry(&fixture.0).unwrap().skills["fixture"].source_fingerprint,
+            Some(original_hash.clone())
+        );
+        fs::write(
+            store(&fixture.0).join("skills/fixture/SKILL.md"),
+            "Edited after migration",
+        )
+        .unwrap();
+        assert_source_operations_rejected(&fixture, "Managed source changed externally");
+        assert_eq!(fingerprint(&files(&source).unwrap()), original_hash);
+    }
+    #[test]
+    fn legacy_zero_target_source_without_fingerprint_is_never_adopted_or_deleted() {
+        for edited in [false, true] {
+            let fixture = Fixture::new();
+            let source = fixture.skill();
+            let original_hash = fingerprint(&files(&source).unwrap());
+            skill_change(&fixture.0, "fixture", source.to_str(), &[], false).unwrap();
+            remove_source_fingerprint(&fixture);
+            if edited {
+                fs::write(
+                    store(&fixture.0).join("skills/fixture/SKILL.md"),
+                    "Unknown cached edits",
+                )
+                .unwrap();
+            }
+            assert_source_operations_rejected(&fixture, "Managed source fingerprint is unknown");
+            assert_eq!(fingerprint(&files(&source).unwrap()), original_hash);
+        }
     }
     #[test]
     fn skill_conflicts_and_modified_targets_are_not_overwritten() {
