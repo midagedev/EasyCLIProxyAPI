@@ -31,6 +31,14 @@ Empty directory layout is preserved and included in the modification guard;
 existing file-only fingerprints remain compatible. MCP conflict checks and
 proposed writes use the same configuration and registry reads.
 
+On Unix, new staging directories, copied Skill roots, and all nested directories
+are created private to the current user (mode 0700 before the umask). File modes,
+including executable bits, are retained behind those private directories.
+Empty directories remain part of the fingerprint, using each copy's actual mode;
+existing fingerprints and existing directory permissions are not rewritten.
+New configuration parent directories are also private; existing external or
+unmanaged parent directories are never chmodded.
+
 The MCP editor masks environment variables and headers by default. It does not
 execute commands or start servers. Clients may start enabled servers when they
 next load their configurations. Disabling removes a server from the selected

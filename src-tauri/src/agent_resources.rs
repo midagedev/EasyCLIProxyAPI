@@ -125,11 +125,21 @@ fn parse_registry(bytes: Option<&[u8]>) -> Result<Registry> {
         None => Ok(Registry::default()),
     }
 }
+fn private_directories(path: &Path, recursive: bool) -> std::io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(recursive);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)
+}
 fn atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     no_links(path)?;
     let parent = path.parent().ok_or("Missing parent")?;
-    fs::create_dir_all(parent).map_err(|_| "Cannot create configuration directory")?;
+    private_directories(parent, true).map_err(|_| "Cannot create configuration directory")?;
     let temporary = path.with_extension("ecpa-tmp");
     no_links(&temporary)?;
     let mut options = fs::OpenOptions::new();
@@ -300,36 +310,40 @@ fn publish_skill(source: &Path, destination: &Path) -> Result<()> {
             .map_err(|_| "Cannot publish skill; destination may already exist".into())
     }
 }
-fn copy_skill(destination: &Path, content: &BTreeMap<PathBuf, SkillFile>) -> Result<()> {
+fn copy_skill(destination: &Path, content: &BTreeMap<PathBuf, SkillFile>) -> Result<String> {
     no_links(destination)?;
     if destination.exists() {
         return Err("Skill target already exists; no files were overwritten".into());
     }
     let staging = destination.with_extension("ecpa-stage");
     no_links(&staging)?;
-    fs::create_dir_all(destination.parent().ok_or("Missing skill parent")?)
+    private_directories(destination.parent().ok_or("Missing skill parent")?, true)
         .map_err(|_| "Cannot create skill parent")?;
-    fs::create_dir(&staging)
+    private_directories(&staging, false)
         .map_err(|_| "Skill staging directory already exists or is not writable")?;
     let outcome = (|| {
         for (relative, file) in content {
             let path = staging.join(relative);
             if file.directory {
-                fs::create_dir_all(&path).map_err(|_| "Cannot create skill directory")?;
+                private_directories(&path, true).map_err(|_| "Cannot create skill directory")?;
             } else {
                 atomic(&path, &file.bytes)?;
             }
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(
-                    &path,
-                    fs::Permissions::from_mode(file.permissions.mode() & 0o777),
-                )
-                .map_err(|_| "Cannot preserve skill permissions")?;
+                if !file.directory {
+                    fs::set_permissions(
+                        &path,
+                        fs::Permissions::from_mode(file.permissions.mode() & 0o777),
+                    )
+                    .map_err(|_| "Cannot preserve skill permissions")?;
+                }
             }
         }
-        publish_skill(&staging, destination)
+        let hash = fingerprint(&files(&staging)?);
+        publish_skill(&staging, destination)?;
+        Ok(hash)
     })();
     if outcome.is_err() {
         let _ = fs::remove_dir_all(staging);
@@ -454,7 +468,7 @@ fn skill_change(
         cache.clone()
     };
     let content = files(&source_path)?;
-    let hash = fingerprint(&content);
+    let mut hash = fingerprint(&content);
     let previous = state
         .skills
         .get(name)
@@ -466,7 +480,7 @@ fn skill_change(
             .as_ref()
             .or_else(|| previous.values().next())
             .ok_or("Managed source fingerprint is unknown; no files were changed; import it under a new identifier")?;
-        if *expected != hash || previous.values().any(|expected| *expected != hash) {
+        if *expected != hash {
             return Err(
                 "Managed source changed externally; import it under a new identifier".into(),
             );
@@ -488,7 +502,7 @@ fn skill_change(
                 removals.push(path.clone());
             }
             if wanted && !path.exists() {
-                additions.push(path);
+                additions.push((agent, path));
             }
         } else if wanted {
             if path.exists() {
@@ -496,7 +510,7 @@ fn skill_change(
                     "{agent}: an unmanaged skill already occupies this name"
                 ));
             }
-            additions.push(path);
+            additions.push((agent, path));
         }
     }
     if importing && cache.exists() {
@@ -514,14 +528,16 @@ fn skill_change(
     }
     let mut created = Vec::new();
     let mut removed = Vec::new();
+    let mut target_hashes = previous.clone();
     let outcome = (|| {
         if importing {
-            copy_skill(&cache, &content)?;
-            created.push(cache.clone());
+            hash = copy_skill(&cache, &content)?;
+            created.push((cache.clone(), hash.clone()));
         }
-        for path in additions {
-            copy_skill(&path, &content)?;
-            created.push(path);
+        for (agent, path) in additions {
+            let copied_hash = copy_skill(&path, &content)?;
+            target_hashes.insert(agent.into(), copied_hash.clone());
+            created.push((path, copied_hash));
         }
         for path in removals {
             let backup = path.with_extension("ecpa-remove");
@@ -542,7 +558,7 @@ fn skill_change(
                         .unwrap_or_else(|| source_path.display().to_string()),
                     targets: targets
                         .iter()
-                        .map(|agent| (agent.clone(), hash.clone()))
+                        .map(|agent| (agent.clone(), target_hashes[agent].clone()))
                         .collect(),
                 },
             );
@@ -551,8 +567,8 @@ fn skill_change(
     })();
     if outcome.is_err() {
         let mut failed = false;
-        for path in created {
-            if files(&path).is_ok_and(|content| fingerprint(&content) == hash) {
+        for (path, expected) in created {
+            if files(&path).is_ok_and(|content| fingerprint(&content) == expected) {
                 failed |= fs::remove_dir_all(path).is_err();
             } else {
                 failed = true;
@@ -1550,6 +1566,250 @@ mod tests {
         )
         .is_err());
         assert!(!store(&fixture.0).exists());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn imported_skill_directories_are_private_without_changing_source_or_unmanaged_parents() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = Fixture::new();
+        let source = fixture.skill();
+        let secret = fixture.write("source/protected/nested/secret.txt", "private fixture");
+        fs::create_dir_all(source.join("empty/nested")).unwrap();
+        for path in [&source, &source.join("protected")] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::set_permissions(
+            source.join("scripts/check.sh"),
+            fs::Permissions::from_mode(0o751),
+        )
+        .unwrap();
+        let unmanaged = fixture.0.join(".codex/skills");
+        fs::create_dir_all(&unmanaged).unwrap();
+        fs::set_permissions(&unmanaged, fs::Permissions::from_mode(0o755)).unwrap();
+        let source_hash = fingerprint(&files(&source).unwrap());
+        skill_change(
+            &fixture.0,
+            "fixture",
+            source.to_str(),
+            &targets(),
+            ResourceOperation::Create,
+        )
+        .unwrap();
+        let mut copies = vec![store(&fixture.0).join("skills/fixture")];
+        copies.extend(
+            AGENTS.map(|agent| agent_dir(&fixture.0, agent).unwrap().join("skills/fixture")),
+        );
+        for root in copies {
+            for relative in [
+                "",
+                "scripts",
+                "protected",
+                "protected/nested",
+                "empty",
+                "empty/nested",
+            ] {
+                assert_eq!(
+                    fs::metadata(root.join(relative))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o077,
+                    0,
+                    "{} must be private",
+                    root.join(relative).display()
+                );
+            }
+            assert_eq!(
+                fs::metadata(root.join("scripts/check.sh"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o751
+            );
+            assert_eq!(
+                fs::metadata(root.join("protected/nested/secret.txt"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o644
+            );
+        }
+        assert_eq!(
+            fs::metadata(&unmanaged).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(fingerprint(&files(&source).unwrap()), source_hash);
+        assert_eq!(
+            fs::metadata(&source).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        skill_change(&fixture.0, "fixture", None, &[], ResourceOperation::Edit).unwrap();
+        skill_change(
+            &fixture.0,
+            "fixture",
+            None,
+            &targets(),
+            ResourceOperation::Edit,
+        )
+        .unwrap();
+        skill_change(&fixture.0, "fixture", None, &[], ResourceOperation::Remove).unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn private_directory_creation_and_sensitive_writes_leave_existing_modes_unchanged() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = Fixture::new();
+        let original_mode = fs::metadata(&fixture.0).unwrap().permissions().mode();
+        let staging = fixture.0.join("new/skills/fixture.ecpa-stage");
+        private_directories(staging.parent().unwrap(), true).unwrap();
+        private_directories(&staging, false).unwrap();
+        assert!(private_directories(&staging, false).is_err());
+        atomic(&staging.join("nested/config.json"), b"secret").unwrap();
+        for relative in [
+            "new",
+            "new/skills",
+            "new/skills/fixture.ecpa-stage",
+            "new/skills/fixture.ecpa-stage/nested",
+        ] {
+            assert_eq!(
+                fs::metadata(fixture.0.join(relative))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o077,
+                0
+            );
+        }
+        assert_eq!(
+            fs::metadata(staging.join("nested/config.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(&fixture.0).unwrap().permissions().mode(),
+            original_mode
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn legacy_empty_directory_permissions_remain_guarded_when_adding_private_targets() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = Fixture::new();
+        let source = fixture.skill();
+        fs::create_dir(source.join("empty")).unwrap();
+        skill_change(
+            &fixture.0,
+            "fixture",
+            source.to_str(),
+            &["claude".into()],
+            ResourceOperation::Create,
+        )
+        .unwrap();
+        let cache = store(&fixture.0).join("skills/fixture");
+        let claude = fixture.0.join(".claude/skills/fixture");
+        for root in [&cache, &claude] {
+            fs::set_permissions(root.join("empty"), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let hash = fingerprint(&files(&cache).unwrap());
+        let mut state = registry(&fixture.0).unwrap();
+        let managed = state.skills.get_mut("fixture").unwrap();
+        managed.source_fingerprint = None;
+        managed.targets.insert("claude".into(), hash.clone());
+        save_registry(&fixture.0, &state).unwrap();
+        skill_change(
+            &fixture.0,
+            "fixture",
+            None,
+            &targets(),
+            ResourceOperation::Edit,
+        )
+        .unwrap();
+        assert_eq!(
+            registry(&fixture.0).unwrap().skills["fixture"].source_fingerprint,
+            Some(hash)
+        );
+        assert_eq!(
+            fs::metadata(fixture.0.join(".codex/skills/fixture/empty"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o077,
+            0
+        );
+        fs::set_permissions(
+            fixture.0.join(".codex/skills/fixture/empty"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let before = fixture_tree(&fixture.0);
+        assert!(
+            skill_change(&fixture.0, "fixture", None, &[], ResourceOperation::Remove)
+                .unwrap_err()
+                .contains("changed externally")
+        );
+        assert_eq!(fixture_tree(&fixture.0), before);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn private_skill_copies_roll_back_when_registry_save_fails() {
+        let fixture = Fixture::new();
+        let source = fixture.skill();
+        fs::create_dir(source.join("empty")).unwrap();
+        let pending = store(&fixture.0).join("state.ecpa-tmp");
+        fs::create_dir_all(pending.parent().unwrap()).unwrap();
+        fs::write(&pending, "keep stale fixture").unwrap();
+        assert!(skill_change(
+            &fixture.0,
+            "fixture",
+            source.to_str(),
+            &targets(),
+            ResourceOperation::Create,
+        )
+        .is_err());
+        assert!(!store(&fixture.0).join("skills/fixture").exists());
+        for agent in AGENTS {
+            assert!(!agent_dir(&fixture.0, agent)
+                .unwrap()
+                .join("skills/fixture")
+                .exists());
+        }
+        assert_eq!(fs::read_to_string(&pending).unwrap(), "keep stale fixture");
+        fs::remove_file(&pending).unwrap();
+        skill_change(
+            &fixture.0,
+            "fixture",
+            source.to_str(),
+            &[],
+            ResourceOperation::Create,
+        )
+        .unwrap();
+        let cache = store(&fixture.0).join("skills/fixture");
+        let before = fixture_tree(&cache);
+        fs::write(&pending, "keep stale fixture").unwrap();
+        assert!(skill_change(
+            &fixture.0,
+            "fixture",
+            None,
+            &targets(),
+            ResourceOperation::Edit
+        )
+        .is_err());
+        assert_eq!(fixture_tree(&cache), before);
+        for agent in AGENTS {
+            assert!(!agent_dir(&fixture.0, agent)
+                .unwrap()
+                .join("skills/fixture")
+                .exists());
+        }
+        assert!(registry(&fixture.0).unwrap().skills["fixture"]
+            .targets
+            .is_empty());
     }
     #[cfg(unix)]
     #[test]
