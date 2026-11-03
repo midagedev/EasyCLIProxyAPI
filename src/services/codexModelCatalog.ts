@@ -10,6 +10,7 @@ export type CodexReasoningLevel = {
 };
 
 export type CodexModelConfiguration = {
+  priority: number;
   display_name: string;
   description: string | null;
   base_instructions: string;
@@ -27,6 +28,7 @@ export type CodexModelConfiguration = {
 
 export type CodexCatalogEditorModel = {
   slug: string;
+  defaultOrder: number;
   hasOfficialTemplate: boolean;
   contextSource: "client" | "configuration" | "template";
   customized: boolean;
@@ -39,6 +41,18 @@ export type CodexCatalogEditorSnapshot = {
   revision: string;
   models: CodexCatalogEditorModel[];
 };
+
+export function parseCodexModelPriority(value: string): number {
+  return value.trim() ? Number(value) : Number.NaN;
+}
+
+export function sortCodexCatalogModels(models: CodexCatalogEditorModel[]): CodexCatalogEditorModel[] {
+  return [...models].sort((left, right) => {
+    const leftPriority = Number.isSafeInteger(left.configuration.priority) ? left.configuration.priority : left.defaults.priority;
+    const rightPriority = Number.isSafeInteger(right.configuration.priority) ? right.configuration.priority : right.defaults.priority;
+    return leftPriority - rightPriority || left.defaultOrder - right.defaultOrder;
+  });
+}
 
 export function codexContextSourceHint(model: CodexCatalogEditorModel): MessageKey {
   if (model.configuration.context_window !== model.defaults.context_window
@@ -62,7 +76,8 @@ export function cloneCodexModelConfiguration(configuration: CodexModelConfigurat
 }
 
 export function sameCodexModelConfiguration(left: CodexModelConfiguration, right: CodexModelConfiguration): boolean {
-  return left.display_name === right.display_name
+  return Object.is(left.priority, right.priority)
+    && left.display_name === right.display_name
     && left.description === right.description
     && left.base_instructions === right.base_instructions
     && Object.is(left.context_window, right.context_window)
@@ -101,6 +116,7 @@ export function toggleCodexReasoningLevel(
 }
 
 export function validateCodexModelConfiguration(configuration: CodexModelConfiguration): MessageKey | null {
+  if (!Number.isSafeInteger(configuration.priority)) return 'agents.catalog.invalidPriority';
   if (!configuration.base_instructions.trim()) return 'agents.catalog.invalidPrompt';
   if (!configuration.display_name.trim() || configuration.display_name.length > 4_000
     || (configuration.description?.length ?? 0) > 4_000) return 'agents.catalog.invalidText';
