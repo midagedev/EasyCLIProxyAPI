@@ -6,6 +6,8 @@ import {
   cloneCodexModelConfiguration,
   codexContextSourceHint,
   codexReasoningEfforts,
+  parseCodexModelPriority,
+  sortCodexCatalogModels,
   sameCodexModelConfiguration,
   toggleCodexReasoningLevel,
   validateCodexModelConfiguration,
@@ -86,8 +88,9 @@ export function CodexModelCatalogDialog({ onClose, onSaved }: CodexModelCatalogD
 
   const filteredModels = useMemo(() => {
     const query = search.trim().toLocaleLowerCase();
-    if (!query) return models;
-    return models.filter((model) => model.slug.toLocaleLowerCase().includes(query)
+    const sorted = sortCodexCatalogModels(models);
+    if (!query) return sorted;
+    return sorted.filter((model) => model.slug.toLocaleLowerCase().includes(query)
       || model.configuration.display_name.toLocaleLowerCase().includes(query));
   }, [models, search]);
 
@@ -246,6 +249,7 @@ export function CodexModelCatalogDialog({ onClose, onSaved }: CodexModelCatalogD
 
               <div className="codex-catalog-form">
                 <label><span>{t('agents.catalog.displayName')}</span><input value={activeModel.configuration.display_name} onChange={(event) => updateField('display_name', event.currentTarget.value)} /></label>
+                <label><span>{t('agents.catalog.priority')}</span><input type="number" step="1" min={Number.MIN_SAFE_INTEGER} max={Number.MAX_SAFE_INTEGER} value={Number.isFinite(activeModel.configuration.priority) ? activeModel.configuration.priority : ''} onChange={(event) => updateField('priority', parseCodexModelPriority(event.currentTarget.value))} aria-label={t('agents.catalog.priority')} aria-describedby="codex-catalog-priority-hint" aria-invalid={!Number.isSafeInteger(activeModel.configuration.priority)} /><small id="codex-catalog-priority-hint">{t('agents.catalog.priorityHint')}</small></label>
                 <label className="wide"><span>{t('agents.catalog.description')}</span><textarea value={activeModel.configuration.description ?? ''} onChange={(event) => updateField('description', event.currentTarget.value || null)} /></label>
                 <label><span>{t('agents.catalog.context')}</span><input type="number" min="1" value={Number.isFinite(activeModel.configuration.context_window) ? activeModel.configuration.context_window : ''} onChange={(event) => updateField('context_window', event.currentTarget.value ? Number(event.currentTarget.value) : Number.NaN)} /></label>
                 <label><span>{t('agents.catalog.maximum')}</span><input type="number" min="1" value={Number.isFinite(activeModel.configuration.max_context_window) ? activeModel.configuration.max_context_window : ''} onChange={(event) => updateField('max_context_window', event.currentTarget.value ? Number(event.currentTarget.value) : Number.NaN)} /></label>
