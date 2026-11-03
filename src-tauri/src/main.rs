@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod agents;
+mod agent_resources;
 mod agent_usage;
 mod agent_usage_store;
 mod app_settings;
@@ -2880,6 +2881,9 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            agent_resources::get_agent_resources,
+            agent_resources::update_agent_skill,
+            agent_resources::update_agent_mcp,
             window_activity::main_window_active,
             desktop_theme::get_linux_system_theme,
             desktop_theme::list_custom_themes,

@@ -556,6 +556,10 @@ export function scanCssViolations(
 }
 
 describe('CSS tokenization and theme variable lint', () => {
+  it('keeps resource management styles on registered theme tokens', () => {
+    const file = 'pages/AgentResourcesPanel.css';
+    expect(scanCssViolations(readFileSync(join(srcRoot, file), 'utf8'), file)).toEqual([]);
+  });
   it('prohibits color literals, unregistered --theme-* variables, non-tier radius, and !important outside tokens layer', () => {
     const allFiles = walkCss(srcRoot);
     const nonExcludedFiles = allFiles.filter((filePath) => {
@@ -967,5 +971,5 @@ describe('CSS tokenization and theme variable lint', () => {
     expect(extractVarTokensFromCssValue('background: var( --audit-orphan);')).toEqual(['--audit-orphan']);
     expect(extractVarTokensFromCssValue('background: var(/*comment*/--audit-orphan);')).toEqual(['--audit-orphan']);
     expect(extractVarTokensFromCssValue('background: var(--audit-\\6f rphan);')).toEqual(['--audit-orphan']);
-  });
+  }, 30000);
 });

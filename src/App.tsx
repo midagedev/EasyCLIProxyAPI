@@ -43,7 +43,7 @@ import { KernelPage } from './pages/Kernel';
 import { VersionManagementPage } from './pages/VersionManagementPage';
 import { OAuthManagementPage } from './pages/ManagementPages';
 import { QuotaPage } from './pages/QuotaPage';
-import { AgentsPage } from './pages/AgentsPage';
+import { AgentManagementPage } from './pages/AgentManagementPage';
 import { EasyModePage } from './pages/EasyModePage';
 import { UsageRecordsPage } from './pages/UsageRecordsPage';
 import { RoutingPage } from './pages/routing/RoutingPage';
@@ -105,7 +105,7 @@ const pages = [
     id: 'agents',
     labelKey: 'app.nav.agents',
     icon: Bot,
-    component: AgentsPage,
+    component: AgentManagementPage,
   },
   {
     id: 'usage-records',

@@ -1,4 +1,5 @@
 import { routingJa } from './locales/routing';
+import { agentResourcesJa } from './agentResources';
 import type { MessageKey } from './locales/zh-CN';
 import { easyModeJa } from './easyMode';
 import { homeJa } from './home';
@@ -16,6 +17,7 @@ export const jaOverrides = {
 'agents.catalog.priority': '表示優先度',
   'agents.catalog.priorityHint': '小さい数値ほど先に表示されます。表示順のみを変更し、認証情報のルーティングやリクエストのサービス階層には影響しません。',
   'agents.catalog.invalidPriority': '表示優先度は -9007199254740991 から 9007199254740991 までの整数で指定してください。',
+...agentResourcesJa,
   ...routingJa,
   ...themeDiyJa,
   'app.window.minimize': '最小化',
